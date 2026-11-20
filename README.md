@@ -19,7 +19,7 @@ Tek dosya · ~430 KB · kurulum yok · Direct2D + DirectComposition</p>
 
 ## Kurulum
 
-1. [Releases](../../releases) sayfasından `NovaBar.exe`'yi indir, kalıcı bir klasöre koy (ör. `C:\Araclar\NovaBar`).
+1. **[NovaBar.exe'yi indir](https://github.com/kiralikceset/novabar/raw/main/bin/NovaBar.exe)** ve kalıcı bir klasöre koy (ör. `C:\Araclar\NovaBar`).
 2. Çalıştır. İmzasız olduğu için SmartScreen uyarısı çıkabilir: **Ek bilgi → Yine de çalıştır**.
 3. Bara sağ tıkla → **Windows ile başlat**.
 
