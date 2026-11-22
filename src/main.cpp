@@ -268,6 +268,7 @@ static void Glyph(ID2D1RenderTarget* rt, const wchar_t* g, IDWriteTextFormat* f,
 static void DrawWeatherIcon(ID2D1RenderTarget* rt, int code, bool day, float cx, float cy, float s);
 static void SendKeys(std::initializer_list<WORD> keys); static void ActivateWin(HWND w); static void ReleasePopupDevice(); static void ClickApp(AppItem* it);
 static bool g_fullscreen = false;
+static HWND g_pop = nullptr;
 static bool g_tracking = false, g_mouseIn = false; static float g_mouseRawX = 0;
 
 static bool g_animating = false;
@@ -1209,6 +1210,7 @@ static void WriteRunValue() {
     RegSetValueExW(k, L"NovaBar", 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * 2));
     RegCloseKey(k);
 }
+static void SyncLogonTask(bool on);
 static void SetAutoStart(bool on) {
     if (on) {
         WriteRunValue();
@@ -1220,14 +1222,80 @@ static void SetAutoStart(bool on) {
         }
         // a downloaded exe carries an "from the internet" mark that can block it at sign-in: remove it (same as Properties > Unblock)
         DeleteFileW((g_exePath + L":Zone.Identifier").c_str());
+        SyncLogonTask(true);
         Log(L"autostart on: %ls", g_exePath.c_str());
     } else {
         HKEY k;
         if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_WRITE, &k) == ERROR_SUCCESS) { RegDeleteValueW(k, L"NovaBar"); RegCloseKey(k); }
         if (RegOpenKeyExW(HKEY_CURRENT_USER, kApprovedKey, 0, KEY_WRITE, &k) == ERROR_SUCCESS) { RegDeleteValueW(k, L"NovaBar"); RegCloseKey(k); }
+        SyncLogonTask(false);
         Log(L"autostart off");
     }
 }
+
+// ── Task Scheduler logon task: starts NovaBar right at sign-in (no start-up app delay)
+//    and restarts it within a minute if it ever crashes. The Run entry stays as a fallback.
+static std::wstring XmlEsc(const std::wstring& s) {
+    std::wstring o; for (wchar_t c : s) { if (c == L'&') o += L"&amp;"; else if (c == L'<') o += L"&lt;"; else if (c == L'>') o += L"&gt;"; else if (c == L'"') o += L"&quot;"; else o += c; }
+    return o;
+}
+static DWORD RunHidden(const std::wstring& cmdline, DWORD waitMs) {
+    STARTUPINFOW si = {sizeof(si)}; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {}; std::wstring c = cmdline; DWORD code = (DWORD)-1;
+    if (CreateProcessW(nullptr, &c[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        if (WaitForSingleObject(pi.hProcess, waitMs) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+    return code;
+}
+static std::wstring SysExe(const wchar_t* name) { wchar_t d[MAX_PATH] = {}; GetSystemDirectoryW(d, MAX_PATH); return std::wstring(L"\"") + d + L"\\" + name + L"\""; }
+static bool WriteLogonTask() {
+    wchar_t user[256] = {}; DWORD un = 256; GetUserNameW(user, &un);
+    wchar_t dom[256] = {}; DWORD dn = GetEnvironmentVariableW(L"USERDOMAIN", dom, 256);
+    std::wstring uid = (dn > 0 && dn < 256) ? std::wstring(dom) + L"\\" + user : std::wstring(user);
+    std::wstring dir = g_exePath.substr(0, g_exePath.find_last_of(L'\\'));
+    std::wstring x =
+        L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+        L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+        L"<RegistrationInfo><Description>NovaBar - görev çubuğu</Description></RegistrationInfo>\r\n"
+        L"<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + XmlEsc(uid) + L"</UserId></LogonTrigger></Triggers>\r\n"
+        L"<Principals><Principal id=\"Author\"><UserId>" + XmlEsc(uid) + L"</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n"
+        L"<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+        L"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>false</StartWhenAvailable>"
+        L"<RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>"
+        L"<AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><RunOnlyIfIdle>false</RunOnlyIfIdle>"
+        L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>4</Priority>"
+        L"<RestartOnFailure><Interval>PT1M</Interval><Count>10</Count></RestartOnFailure></Settings>\r\n"
+        L"<Actions Context=\"Author\"><Exec><Command>" + XmlEsc(g_exePath) + L"</Command><Arguments>--autostart</Arguments><WorkingDirectory>" + XmlEsc(dir) + L"</WorkingDirectory></Exec></Actions>\r\n"
+        L"</Task>\r\n";
+    wchar_t tmp[MAX_PATH] = {}; GetTempPathW(MAX_PATH, tmp);
+    std::wstring xf = std::wstring(tmp) + L"NovaBar.task.xml";
+    HANDLE f = CreateFileW(xf.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD w; WORD bom = 0xFEFF; WriteFile(f, &bom, 2, &w, nullptr); WriteFile(f, x.c_str(), (DWORD)(x.size() * 2), &w, nullptr); CloseHandle(f);
+    DWORD code = RunHidden(SysExe(L"schtasks.exe") + L" /Create /TN \"NovaBar\" /XML \"" + xf + L"\" /F", 15000);
+    DeleteFileW(xf.c_str());
+    Log(L"logon task %ls (schtasks exit %ld)", code == 0 ? L"created" : L"could not be created", (long)code);
+    return code == 0;
+}
+static void DeleteLogonTask() {
+    DWORD code = RunHidden(SysExe(L"schtasks.exe") + L" /Delete /TN \"NovaBar\" /F", 15000);
+    Log(L"logon task removed (schtasks exit %ld)", (long)code);
+}
+static DWORD WINAPI TaskThread(LPVOID p) { if (p) WriteLogonTask(); else DeleteLogonTask(); return 0; }
+static void SyncLogonTask(bool on) { HANDLE t = CreateThread(nullptr, 0, TaskThread, on ? (LPVOID)1 : nullptr, 0, nullptr); if (t) CloseHandle(t); }
+
+// ── Windows' own shell flyouts (Quick Settings, notifications, Start, Search) close only when another
+//    window takes focus. NovaBar never takes focus, so a click on the bar dismisses them explicitly.
+static bool ShellFlyoutOpen() {
+    HWND fg = GetForegroundWindow(); if (!fg || fg == g_hwnd || fg == g_pop) return false;
+    DWORD pid = 0; GetWindowThreadProcessId(fg, &pid);
+    std::wstring p = Lower(ProcPath(pid)); size_t s0 = p.find_last_of(L'\\'); if (s0 != std::wstring::npos) p = p.substr(s0 + 1);
+    return p == L"shellexperiencehost.exe" || p == L"startmenuexperiencehost.exe" || p == L"searchhost.exe" ||
+           p == L"searchapp.exe" || p == L"shellhost.exe" || p == L"windows.ui.notifications.exe";
+}
+static bool g_shellFlyoutWasOpen = false;
+static void DismissShellFlyout() { g_shellFlyoutWasOpen = ShellFlyoutOpen(); if (g_shellFlyoutWasOpen) SendKeys({VK_ESCAPE}); }
 
 // ───────────────────────────── graphics device ─────────────────────────────
 static void ReleaseBrushes() { SafeRelease(g_br); SafeRelease(g_acc); SafeRelease(g_sheen); SafeRelease(g_spot); SafeRelease(g_shadow); SafeRelease(g_edge); SafeRelease(g_accGlow); SafeRelease(g_rim); }
@@ -1349,7 +1417,6 @@ struct Tile {
     HWND w = nullptr; HTHUMBNAIL th = nullptr; D2D1_RECT_F r = {}, area = {}; SIZE src = {0, 0};
     std::wstring title; bool iconic = false; Spring hover, closeH; IDWriteTextLayout* tl = nullptr;
 };
-static HWND g_pop = nullptr;
 static IDXGISwapChain1* g_popSwap = nullptr; static ID2D1Bitmap1* g_popTarget = nullptr;
 static IDCompositionTarget* g_popDT = nullptr; static IDCompositionVisual* g_popVis = nullptr;
 static int g_popPxW = 0, g_popPxH = 0, g_popSwapW = 0, g_popSwapH = 0;
@@ -2531,6 +2598,7 @@ static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_popMode == PM_PREVIEW) SetTimer(g_hwnd, TMR_POPHIDE, 280, nullptr);
         Kick(); return 0;
     case WM_LBUTTONDOWN:
+        DismissShellFlyout();
         g_popPressTile = g_popHoverTile; g_fbPress = g_fbHover;
         if (g_popMode == PM_CONTROL && InR(g_volTrack, x, y)) { g_volDrag = true; SetCapture(h); SetVolumeAbs((x - 72.f) / std::max(1.f, (g_popW - 66.f) - 72.f)); Kick(); }
         return 0;
@@ -2766,7 +2834,7 @@ static void DoClick(const Hit& h) {
     bool toggles = h.k == RK_QUICK || h.k == RK_CLOCK || h.k == RK_WEATHER;
     if (Sticky() && !toggles) ClosePopup();
     switch (h.k) {
-    case RK_START: SendKeys({VK_LWIN}); break;
+    case RK_START: if (!g_shellFlyoutWasOpen) SendKeys({VK_LWIN}); break; // a second click closes Start
     case RK_APP: if (h.it) { ClosePopup(); ClickApp(h.it); } break;
     case RK_STATS: ShellExecuteW(nullptr, L"open", L"taskmgr.exe", nullptr, nullptr, SW_SHOWNORMAL); break;
     case RK_QUICK: if (Sticky() && g_popMode == PM_CONTROL && g_popA.t > 0.5f) ClosePopup(); else OpenFlyout(PM_CONTROL, (g_rQuick.left + g_rQuick.right) / 2); break;
@@ -2848,6 +2916,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_MOUSELEAVE: g_tracking = false; g_mouseIn = false; g_barHover.t = 0; SetHover(Hit()); return 0;
     case WM_LBUTTONDOWN: {
+        DismissShellFlyout();
         SetCapture(hwnd); g_press = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale); SetHover(g_hover);
         g_dragCand = (g_press.k == RK_APP && g_press.it && g_press.it->pinned && !g_press.it->special) ? g_press.it : nullptr;
         g_dragDownX = GET_X_LPARAM(lp) / g_scale - g_md;
@@ -2878,6 +2947,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MBUTTONUP: { Hit h = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale); if (h.k == RK_APP && h.it) { h.it->ripple = 0; if (h.it->wins.empty()) h.it->bounce = 0; Launch(h.it); Kick(); } return 0; }
+    case WM_RBUTTONDOWN: DismissShellFlyout(); return 0;
     case WM_RBUTTONUP: {
         Hit h = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale);
         ClosePopupNow();
@@ -2983,16 +3053,16 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     bool autostart = a1 == L"--autostart";
     Log(L"start%ls (%ls)", autostart ? L" at sign-in" : L"", g_exePath.c_str());
     // keep the start-up entry pointing at this exe, even after it was moved
-    if (RunValueExists()) WriteRunValue();
+    if (RunValueExists()) { WriteRunValue(); if (!autostart) SyncLogonTask(true); }
     if (autostart) {
         // at sign-in, wait for the Windows shell and the desktop compositor before building the bar
         ULONGLONG t0 = GetTickCount64(); BOOL comp = FALSE;
         while (GetTickCount64() - t0 < 120000) {
             comp = FALSE; DwmIsCompositionEnabled(&comp);
             if (FindWindowW(L"Shell_TrayWnd", nullptr) && comp) break;
-            Sleep(500);
+            Sleep(150);
         }
-        Sleep(1500);
+        Sleep(250);
         Log(L"shell ready after %llu ms", (unsigned long long)(GetTickCount64() - t0));
     }
     SetUnhandledExceptionFilter(CrashFilter);

@@ -29,6 +29,7 @@ Tek dosya · ~500 KB · kurulum yok · Direct2D + DirectComposition</p>
 1. **[NovaBar.exe'yi indir](https://github.com/kiralikceset/novabar/raw/main/bin/NovaBar.exe)** ve kalıcı bir klasöre koy (ör. `C:\Araclar\NovaBar`).
 2. Çalıştır. İmzasız olduğu için SmartScreen uyarısı çıkabilir: **Ek bilgi → Yine de çalıştır**.
 3. Bara sağ tıkla → **Windows ile başlat**.
+   NovaBar, oturum açılır açılmaz (bekleme olmadan) çalışan bir Görev Zamanlayıcı görevi kurar; çökerse 1 dakika içinde kendini yeniden başlatır.
    NovaBar.exe'yi önce kalıcı klasörüne taşı, sonra bu seçeneği aç. Açılışta çalışmazsa exe'nin yanındaki `NovaBar.log` dosyası ne olduğunu yazar; ayrıca *Ayarlar → Uygulamalar → Başlangıç* listesinde NovaBar'ın açık olduğuna bak.
 
 Ayarlar exe'nin yanındaki `NovaBar.ini` dosyasında (sağ tık → *Ayar dosyasını aç*): konum, yükseklik, kenar boşluğu, ada/tek parça görünüm, vurgu renkleri (`AutoAccent=0` ile elle), hava durumu şehri (`WeatherCity`), odak süresi (`FocusMinutes`) ve tüm özelliklerin aç/kapa anahtarları.
