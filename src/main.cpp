@@ -32,6 +32,8 @@
 #include <roapi.h>
 #include <winstring.h>
 #include <shcore.h>
+#include <winhttp.h>
+#include <powrprof.h>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -94,6 +96,7 @@ struct Config {
     uint32_t accent = 0x7AA2FF, accent2 = 0xB983FF;
     bool center = true, stats = true, title = true, hideTaskbar = true, islands = true;
     bool media = true, previews = true, trash = true, lang = true;
+    bool weather = true, autoAccent = true; int focusMin = 25; std::wstring city = L"Istanbul";
 } g_cfg;
 struct Pin { std::wstring key, target; };
 static std::vector<Pin> g_pins;
@@ -136,6 +139,12 @@ static void WriteDefaultIni() {
         L"WindowPreviews=1\r\n"
         L"ShowTrash=1\r\n"
         L"ShowKeyboardLayout=1\r\n"
+        L"; Hava durumu (open-meteo.com) için şehir\r\n"
+        L"ShowWeather=1\r\n"
+        L"WeatherCity=Istanbul\r\n"
+        L"; 1 = vurgu renklerini duvar kâğıdından al (Accent/Accent2 yok sayılır)\r\n"
+        L"AutoAccent=1\r\n"
+        L"FocusMinutes=25\r\n"
         L"\r\n[Pins]\r\nCount=1\r\n0=c:\\windows\\explorer.exe|explorer.exe\r\n";
     HANDLE f = CreateFileW(g_iniPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -160,6 +169,10 @@ static void LoadConfig() {
     g_cfg.previews = IniInt(L"Bar", L"WindowPreviews", 1) != 0;
     g_cfg.trash = IniInt(L"Bar", L"ShowTrash", 1) != 0;
     g_cfg.lang = IniInt(L"Bar", L"ShowKeyboardLayout", 1) != 0;
+    g_cfg.weather = IniInt(L"Bar", L"ShowWeather", 1) != 0;
+    g_cfg.city = IniGet(L"Bar", L"WeatherCity", L"Istanbul"); if (g_cfg.city.empty()) g_cfg.city = L"Istanbul";
+    g_cfg.autoAccent = IniInt(L"Bar", L"AutoAccent", 1) != 0;
+    g_cfg.focusMin = std::max(1, std::min(180, IniInt(L"Bar", L"FocusMinutes", 25)));
     g_pins.clear();
     int n = IniInt(L"Pins", L"Count", 0);
     for (int i = 0; i < n && i < 64; i++) {
@@ -183,6 +196,8 @@ static int g_pxW = 0, g_pxH = 0;
 static UINT WM_TASKBARCREATED = 0;
 #define WM_APPBAR (WM_APP + 1)
 #define WM_REFRESH (WM_APP + 2)
+#define WM_WEATHER (WM_APP + 5)
+#define WM_CLOSEFLY (WM_APP + 6)
 enum { TMR_POLL = 1, TMR_REFRESH = 2, TMR_VOLHIDE = 3, TMR_REHIDE = 4, TMR_FAST = 5, TMR_POPUP = 6, TMR_POPHIDE = 7 };
 
 static ID2D1Factory1* g_d2d = nullptr;
@@ -203,7 +218,7 @@ static ID2D1SolidColorBrush* g_br = nullptr;
 static ID2D1LinearGradientBrush* g_acc = nullptr;
 static ID2D1LinearGradientBrush* g_sheen = nullptr; static ID2D1LinearGradientBrush* g_rim = nullptr;
 static ID2D1RadialGradientBrush *g_spot = nullptr, *g_shadow = nullptr, *g_edge = nullptr, *g_accGlow = nullptr;
-static IDWriteTextFormat *g_fStatC = nullptr, *g_fTile = nullptr, *g_fStatV = nullptr, *g_fTime = nullptr, *g_fDate = nullptr, *g_fSmall = nullptr, *g_fTitle = nullptr, *g_fIcon = nullptr, *g_fIconS = nullptr, *g_fLetter = nullptr;
+static IDWriteTextFormat *g_fBig = nullptr, *g_fMid = nullptr, *g_fSmallC = nullptr, *g_fSmallR = nullptr, *g_fCal = nullptr, *g_fIconL = nullptr, *g_fStatC = nullptr, *g_fTile = nullptr, *g_fStatV = nullptr, *g_fTime = nullptr, *g_fDate = nullptr, *g_fSmall = nullptr, *g_fTitle = nullptr, *g_fIcon = nullptr, *g_fIconS = nullptr, *g_fLetter = nullptr;
 static IDWriteInlineObject *g_ellipsis = nullptr, *g_ellipsis2 = nullptr, *g_ellipsis3 = nullptr;
 static float g_alpha = 1.f;
 
@@ -222,7 +237,7 @@ struct AppItem {
 };
 static std::vector<AppItem*> g_items;
 
-enum RK { RK_NONE, RK_START, RK_APP, RK_STATS, RK_QUICK, RK_CLOCK, RK_DESK, RK_MINFO, RK_MPREV, RK_MPLAY, RK_MNEXT, RK_LANG };
+enum RK { RK_NONE, RK_START, RK_APP, RK_STATS, RK_QUICK, RK_CLOCK, RK_DESK, RK_MINFO, RK_MPREV, RK_MPLAY, RK_MNEXT, RK_LANG, RK_FOCUS, RK_WEATHER };
 struct Hit { RK k = RK_NONE; AppItem* it = nullptr; bool operator==(const Hit& o) const { return k == o.k && it == o.it; } };
 static Hit g_hover, g_press;
 static Spring g_hStart, g_pStart, g_hStats, g_hQuick, g_pQuick, g_hClock, g_pClock, g_hDesk, g_pDesk;
@@ -247,7 +262,9 @@ static bool g_dragSwapPending = false;
 static AppItem *g_dragCand = nullptr, *g_dragItem = nullptr; static float g_dragDownX = 0, g_dragX = 0; static Spring g_dragLift;
 static Spring g_popA, g_popY; static AppItem *g_popItem = nullptr, *g_hoverPend = nullptr;
 static long long g_trashCount = -1;
-static void ClosePopup(); static void ClosePopupNow(); static void OpenPopup(AppItem* it); static void PopupSync();
+static void ClosePopup(); static void ClosePopupNow(); static void OpenPopup(AppItem* it); static void PopupSync(); static void OpenFlyout(int mode, float anchorX);
+static void Glyph(ID2D1RenderTarget* rt, const wchar_t* g, IDWriteTextFormat* f, float cx, float cy, float box, D2D1_COLOR_F c);
+static void DrawWeatherIcon(ID2D1RenderTarget* rt, int code, bool day, float cx, float cy, float s);
 static void SendKeys(std::initializer_list<WORD> keys); static void ActivateWin(HWND w); static void ReleasePopupDevice(); static void ClickApp(AppItem* it);
 static bool g_fullscreen = false;
 static bool g_tracking = false, g_mouseIn = false; static float g_mouseRawX = 0;
@@ -256,7 +273,8 @@ static bool g_animating = false;
 static LARGE_INTEGER g_qpf, g_last;
 
 // system info
-static std::wstring g_timeStr, g_dateStr; static IDWriteTextLayout *g_tlTime = nullptr, *g_tlDate = nullptr; static float g_clockW = 60, g_timeH = 16, g_dateH = 14;
+static std::wstring g_timeStr, g_dateStr, g_dateLong; static IDWriteTextLayout *g_tlTimeOld = nullptr; static Spring g_clockRoll;
+static IDWriteTextLayout *g_tlTime = nullptr, *g_tlDate = nullptr; static float g_clockW = 60, g_timeH = 16, g_dateH = 14;
 static float g_cpu = 0, g_ram = 0; static ULONGLONG g_lastIdle = 0, g_lastTotal = 0;
 static IAudioEndpointVolume* g_epv = nullptr; static float g_vol = 0.5f; static bool g_mute = false;
 static int g_net = 1; // 0 none, 1 wifi, 2 ethernet
@@ -298,6 +316,12 @@ static void CreateTextResources() {
     g_fIcon = MakeFormat(ico, 14.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_fIconS = MakeFormat(ico, 8.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_fLetter = MakeFormat(disp, 13.f, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g_fBig = MakeFormat(disp, 34.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g_fMid = MakeFormat(disp, 15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g_fSmallC = MakeFormat(ui, 9.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g_fSmallR = MakeFormat(ui, 9.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    g_fCal = MakeFormat(disp, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g_fIconL = MakeFormat(ico, 17.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     if (g_fTitle && SUCCEEDED(g_dw->CreateEllipsisTrimmingSign(g_fTitle, &g_ellipsis))) {
         DWRITE_TRIMMING tr = {DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
         g_fTitle->SetTrimming(&tr, g_ellipsis);
@@ -591,12 +615,232 @@ static void ReadClock() {
     wchar_t t[64] = {}, d[64] = {};
     GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, nullptr, nullptr, t, 64);
     GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"d MMM ddd", d, 64, nullptr);
+    wchar_t dl[96] = {}; GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, nullptr, L"d MMMM yyyy, dddd", dl, 96, nullptr); g_dateLong = dl;
     if (g_timeStr != t || g_dateStr != d || !g_tlTime) {
+        bool roll = g_tlTime && g_timeStr != t;
+        SafeRelease(g_tlTimeOld);
+        if (roll) { g_tlTimeOld = g_tlTime; g_tlTime = nullptr; g_clockRoll.snap(0); g_clockRoll.t = 1; }
         g_timeStr = t; g_dateStr = d; SafeRelease(g_tlTime); SafeRelease(g_tlDate);
         float w1 = 0, w2 = 0; g_tlTime = Layout(g_timeStr, g_fTime, 200, &w1, &g_timeH); g_tlDate = Layout(g_dateStr, g_fDate, 200, &w2, &g_dateH);
         g_clockW = std::max(w1, w2) + 22.f; Kick();
     }
 }
+
+// ───────────────────────────── extras: weather, network speed, dark mode, focus timer ─────────────────────────────
+struct WeatherData {
+    bool ok = false; double temp = 0, tmax = 0, tmin = 0; int code = 0; bool day = true; std::wstring city;
+    int hour[6] = {}; double htemp[6] = {}; int hcode[6] = {}; int hn = 0;
+};
+static WeatherData g_wx; static bool g_wxBusy = false; static ULONGLONG g_wxNext = 0; static std::wstring g_wxErr;
+
+static std::string HttpGet(const wchar_t* host, const std::wstring& path) {
+    std::string out;
+    HINTERNET s = WinHttpOpen(L"NovaBar/1.1", 4 /*WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY*/, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) s = WinHttpOpen(L"NovaBar/1.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) return out;
+    WinHttpSetTimeouts(s, 6000, 6000, 8000, 8000);
+    HINTERNET c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+        if (status == 200) for (;;) {
+            DWORD avail = 0; if (!WinHttpQueryDataAvailable(r, &avail) || !avail) break;
+            std::string buf(avail, '\0'); DWORD rd = 0;
+            if (!WinHttpReadData(r, &buf[0], avail, &rd) || !rd) break;
+            out.append(buf.data(), rd); if (out.size() > 4000000) break;
+        }
+    }
+    if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c); WinHttpCloseHandle(s);
+    return out;
+}
+static std::wstring UrlEncode(const std::wstring& w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string u(n, '\0'); WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &u[0], n, nullptr, nullptr);
+    std::wstring o; wchar_t b[8];
+    for (unsigned char ch : u) {
+        if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') o += (wchar_t)ch;
+        else { swprintf(b, 8, L"%%%02X", ch); o += b; }
+    }
+    return o;
+}
+static std::wstring FromUtf8(const std::string& s) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, L'\0'); MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n); return w;
+}
+static size_t JObj(const std::string& s, const char* name) { // position just after  "name":{
+    std::string k = std::string("\"") + name + "\":{"; size_t p = s.find(k); return p == std::string::npos ? p : p + k.size();
+}
+static bool JNum(const std::string& s, size_t from, const char* key, double& out) {
+    if (from == std::string::npos) return false;
+    std::string k = std::string("\"") + key + "\":"; size_t p = s.find(k, from);
+    size_t end = s.find('}', from); if (p == std::string::npos || (end != std::string::npos && p > end)) return false;
+    const char* c = s.c_str() + p + k.size(); char* e = nullptr; double v = strtod(c, &e); if (e == c) return false; out = v; return true;
+}
+static std::vector<std::string> JArr(const std::string& s, size_t from, const char* key) {
+    std::vector<std::string> v; if (from == std::string::npos) return v;
+    std::string k = std::string("\"") + key + "\":["; size_t p = s.find(k, from); if (p == std::string::npos) return v;
+    p += k.size(); size_t e = s.find(']', p); if (e == std::string::npos) return v;
+    std::string body = s.substr(p, e - p); size_t a = 0;
+    while (a <= body.size()) {
+        size_t b = body.find(',', a); if (b == std::string::npos) b = body.size();
+        std::string it = body.substr(a, b - a);
+        if (!it.empty() && it.front() == '"') it = it.substr(1); if (!it.empty() && it.back() == '"') it.pop_back();
+        v.push_back(it); a = b + 1;
+    }
+    return v;
+}
+static DWORD WINAPI WeatherThread(LPVOID p) {
+    std::wstring* city = (std::wstring*)p;
+    WeatherData* d = new WeatherData();
+    std::string g = HttpGet(L"geocoding-api.open-meteo.com", L"/v1/search?count=1&language=tr&format=json&name=" + UrlEncode(*city));
+    size_t r0 = g.find("\"results\":[");
+    double lat = 0, lon = 0;
+    if (r0 != std::string::npos && JNum(g, r0, "latitude", lat) && JNum(g, r0, "longitude", lon)) {
+        d->city = *city;
+        size_t np = g.find("\"name\":\"", r0);
+        if (np != std::string::npos) { np += 8; size_t ne = g.find('"', np); if (ne != std::string::npos) { std::string nm = g.substr(np, ne - np); if (nm.find('\\') == std::string::npos) d->city = FromUtf8(nm); } }
+        wchar_t q[400];
+        swprintf(q, 400, L"/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,weather_code,is_day&hourly=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=2", lat, lon);
+        std::string f = HttpGet(L"api.open-meteo.com", q);
+        size_t cur = JObj(f, "current");
+        double t = 0, code = 0, isday = 1;
+        if (JNum(f, cur, "temperature_2m", t) && JNum(f, cur, "weather_code", code)) {
+            JNum(f, cur, "is_day", isday);
+            d->temp = t; d->code = (int)code; d->day = isday > 0.5; d->ok = true;
+            size_t dl = JObj(f, "daily");
+            auto mx = JArr(f, dl, "temperature_2m_max"), mn = JArr(f, dl, "temperature_2m_min");
+            if (!mx.empty()) d->tmax = atof(mx[0].c_str()); if (!mn.empty()) d->tmin = atof(mn[0].c_str());
+            std::string ctime; size_t tp = f.find("\"time\":\"", cur);
+            if (tp != std::string::npos) ctime = f.substr(tp + 8, 13);
+            size_t hl = JObj(f, "hourly");
+            auto ht = JArr(f, hl, "time"), htp = JArr(f, hl, "temperature_2m"), hc = JArr(f, hl, "weather_code");
+            size_t idx = 0; for (size_t i = 0; i < ht.size(); i++) if (ht[i].compare(0, 13, ctime) == 0) { idx = i; break; }
+            for (size_t i = idx + 1; i < ht.size() && i < htp.size() && i < hc.size() && d->hn < 6; i++) {
+                d->hour[d->hn] = ht[i].size() >= 13 ? atoi(ht[i].c_str() + 11) : 0;
+                d->htemp[d->hn] = atof(htp[i].c_str()); d->hcode[d->hn] = atoi(hc[i].c_str()); d->hn++;
+            }
+        }
+    }
+    delete city;
+    if (!PostMessageW(g_hwnd, WM_WEATHER, 0, (LPARAM)d)) delete d;
+    return 0;
+}
+static void WeatherTick(bool force = false) {
+    if (!g_cfg.weather || g_wxBusy || !g_hwnd) return;
+    ULONGLONG now = GetTickCount64(); if (!force && now < g_wxNext) return;
+    g_wxBusy = true;
+    HANDLE th = CreateThread(nullptr, 0, WeatherThread, new std::wstring(g_cfg.city), 0, nullptr);
+    if (th) CloseHandle(th); else g_wxBusy = false;
+}
+static int WKind(int c) {
+    if (c == 0) return 0; if (c <= 2) return 1; if (c == 3) return 2; if (c == 45 || c == 48) return 3;
+    if (c >= 51 && c <= 57) return 4; if ((c >= 61 && c <= 67) || (c >= 80 && c <= 82)) return 5;
+    if ((c >= 71 && c <= 77) || c == 85 || c == 86) return 6; if (c >= 95) return 7; return 2;
+}
+static const wchar_t* WDesc(int c) {
+    if (c == 0) return L"Açık"; if (c == 1) return L"Az bulutlu"; if (c == 2) return L"Parçalı bulutlu";
+    static const wchar_t* d[] = {L"Açık", L"Parçalı bulutlu", L"Bulutlu", L"Sisli", L"Çisenti", L"Yağmurlu", L"Karlı", L"Gök gürültülü"};
+    return d[WKind(c)];
+}
+
+// network throughput
+static double g_netDown = 0, g_netUp = 0; static ULONG64 g_lastIn = 0, g_lastOut = 0; static ULONGLONG g_lastNetT = 0;
+static void ReadNetSpeed() {
+    PMIB_IF_TABLE2 t = nullptr; if (GetIfTable2(&t) != NO_ERROR || !t) return;
+    ULONG64 in = 0, out = 0;
+    for (ULONG i = 0; i < t->NumEntries; i++) {
+        const MIB_IF_ROW2& r = t->Table[i];
+        if (r.Type == IF_TYPE_SOFTWARE_LOOPBACK || r.OperStatus != IfOperStatusUp || !r.InterfaceAndOperStatusFlags.HardwareInterface) continue;
+        in += r.InOctets; out += r.OutOctets;
+    }
+    FreeMibTable(t);
+    ULONGLONG now = GetTickCount64();
+    if (g_lastNetT && now > g_lastNetT && in >= g_lastIn && out >= g_lastOut) {
+        double sec = (now - g_lastNetT) / 1000.0;
+        g_netDown = (in - g_lastIn) / sec; g_netUp = (out - g_lastOut) / sec;
+    }
+    g_lastIn = in; g_lastOut = out; g_lastNetT = now;
+}
+static std::wstring FmtRate(double b) {
+    wchar_t s[32];
+    if (b < 1024 * 1024) swprintf(s, 32, L"%.0f KB/s", b / 1024.0);
+    else swprintf(s, 32, L"%.1f MB/s", b / (1024.0 * 1024.0));
+    std::wstring r = s; for (auto& c : r) if (c == L'.') c = L','; return r;
+}
+
+// dark mode (Windows apps + system)
+static const wchar_t* kPersonalize = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+static bool IsDarkMode() {
+    DWORD v = 1, sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, kPersonalize, L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &v, &sz) != ERROR_SUCCESS) return false;
+    return v == 0;
+}
+static void SetDarkMode(bool dark) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kPersonalize, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+        DWORD v = dark ? 0 : 1;
+        RegSetValueExW(k, L"AppsUseLightTheme", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+        RegSetValueExW(k, L"SystemUsesLightTheme", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+        RegCloseKey(k);
+    }
+    DWORD_PTR res; SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"ImmersiveColorSet", SMTO_ABORTIFHUNG, 300, &res);
+}
+
+// focus (pomodoro) timer
+static bool g_focusOn = false, g_focusPaused = false; static ULONGLONG g_focusEnd = 0, g_focusLeft = 0, g_focusDoneAt = 0;
+static long long FocusRemainMs() {
+    if (!g_focusOn) return 0;
+    if (g_focusPaused) return (long long)g_focusLeft;
+    return std::max(0LL, (long long)g_focusEnd - (long long)GetTickCount64());
+}
+static void StartFocus() { g_focusOn = true; g_focusPaused = false; g_focusDoneAt = 0; g_focusEnd = GetTickCount64() + (ULONGLONG)g_cfg.focusMin * 60000ULL; Kick(); }
+static void StopFocus() { g_focusOn = false; g_focusPaused = false; g_focusDoneAt = 0; Kick(); }
+static void ToggleFocusPause() {
+    if (!g_focusOn) return;
+    if (g_focusPaused) { g_focusEnd = GetTickCount64() + g_focusLeft; g_focusPaused = false; }
+    else { g_focusLeft = (ULONGLONG)FocusRemainMs(); g_focusPaused = true; }
+    Kick();
+}
+static bool FocusVisible() { return g_focusOn || (g_focusDoneAt && GetTickCount64() - g_focusDoneAt < 10000); }
+static void FocusTick() {
+    if (g_focusOn && !g_focusPaused && FocusRemainMs() <= 0) {
+        g_focusOn = false; g_focusDoneAt = GetTickCount64();
+        MessageBeep(MB_ICONASTERISK); Kick();
+    }
+    if (FocusVisible() || g_focusDoneAt) Kick();
+    if (g_focusDoneAt && !FocusVisible()) g_focusDoneAt = 0;
+}
+
+// accent colours sampled from the wallpaper
+static uint32_t HsvToRgb(float h, float s, float v) {
+    h = fmodf(h, 360.f); if (h < 0) h += 360.f;
+    float c = v * s, x = c * (1 - fabsf(fmodf(h / 60.f, 2.f) - 1)), m = v - c, r = 0, g = 0, b = 0;
+    if (h < 60) { r = c; g = x; } else if (h < 120) { r = x; g = c; } else if (h < 180) { g = c; b = x; }
+    else if (h < 240) { g = x; b = c; } else if (h < 300) { r = x; b = c; } else { r = c; b = x; }
+    return ((uint32_t)((r + m) * 255) << 16) | ((uint32_t)((g + m) * 255) << 8) | (uint32_t)((b + m) * 255);
+}
+static bool DeriveAccent(const std::vector<uint32_t>& px, uint32_t& a1, uint32_t& a2) {
+    double bins[36] = {}, total = 0;
+    size_t step = std::max<size_t>(1, px.size() / 60000);
+    for (size_t i = 0; i < px.size(); i += step) {
+        uint32_t p = px[i]; float r = ((p >> 16) & 255) / 255.f, g = ((p >> 8) & 255) / 255.f, b = (p & 255) / 255.f;
+        float mx = std::max(r, std::max(g, b)), mn = std::min(r, std::min(g, b)), d = mx - mn;
+        if (mx < 0.22f || d < 0.12f) continue;
+        float s = d / mx, h;
+        if (mx == r) h = 60.f * fmodf((g - b) / d, 6.f); else if (mx == g) h = 60.f * ((b - r) / d + 2.f); else h = 60.f * ((r - g) / d + 4.f);
+        if (h < 0) h += 360.f;
+        double w = s * s * mx; bins[(int)(h / 10.f) % 36] += w; total += w;
+    }
+    if (total < 15.0) return false;
+    double sm[36]; for (int i = 0; i < 36; i++) sm[i] = bins[(i + 35) % 36] * 0.5 + bins[i] + bins[(i + 1) % 36] * 0.5;
+    int b1 = 0; for (int i = 1; i < 36; i++) if (sm[i] > sm[b1]) b1 = i;
+    int b2 = -1; for (int i = 0; i < 36; i++) { int dist = std::min(abs(i - b1), 36 - abs(i - b1)); if (dist >= 4 && (b2 < 0 || sm[i] > sm[b2])) b2 = i; }
+    if (b2 < 0 || sm[b2] < sm[b1] * 0.15) b2 = (b1 + 4) % 36;
+    a1 = HsvToRgb(b1 * 10.f + 5.f, 0.52f, 1.0f); a2 = HsvToRgb(b2 * 10.f + 5.f, 0.50f, 1.0f);
+    return true;
+}
+static bool g_brushDirty = false;
 
 // ───────────────────────────── media (GlobalSystemMediaTransportControls via raw WinRT ABI) ─────────────────────────────
 struct NbAsyncInfo : public IInspectable {
@@ -1067,6 +1311,19 @@ static float g_popW = 0, g_popH = 0; static bool g_popShown = false, g_popTracki
 static std::vector<Tile> g_tiles; static IDWriteTextLayout* g_popLabel = nullptr; static float g_popLabelW = 0, g_popLabelH = 0;
 static int g_popHoverTile = -1, g_popPressTile = -1; static bool g_popHoverClose = false;
 static const float kTileW = 188.f, kThumbH = 112.f, kPad = 10.f, kGapT = 8.f, kTitleH = 22.f;
+enum { PM_PREVIEW = 0, PM_CONTROL = 1, PM_TODAY = 2 };
+static int g_popMode = PM_PREVIEW;
+static float g_popCaretX = 0; static const float kCaret = 7.f;
+static HHOOK g_mouseHook = nullptr;
+struct FlyBtn { int id = 0; D2D1_RECT_F r = {}; Spring hv; bool seen = false; };
+static std::vector<FlyBtn> g_fb; static int g_fbHover = -1, g_fbPress = -1;
+static bool g_volDrag = false; static D2D1_RECT_F g_volTrack = {};
+static int g_armId = -1; static ULONGLONG g_armTime = 0;
+static int g_calY = 2026, g_calM = 1; static bool g_dark = false;
+static Spring g_focW, g_hFocus, g_hWeather, g_pWeather;
+static D2D1_RECT_F g_rFocus, g_rWeather;
+enum { FB_MUTE = 1, FB_DARK, FB_FOCUS, FB_SNIP, FB_CLIP, FB_EMOJI, FB_WIFI, FB_BT, FB_SETTINGS, FB_LOCK, FB_SLEEP, FB_RESTART, FB_SHUTDOWN, FB_QUICK, FB_CALPREV, FB_CALNEXT, FB_NOTIF, FB_VOL };
+static bool Sticky() { return g_popShown && g_popMode != PM_PREVIEW; }
 
 static bool UpdateAnims(float dt) {
     bool m = false;
@@ -1080,6 +1337,8 @@ static bool UpdateAnims(float dt) {
     m |= g_mW.lay(dt); m |= g_mA.ui(dt); m |= g_mPlayT.step(dt, 320.f, 26.f, 0.002f);
     m |= g_hMInfo.ui(dt); m |= g_hMPrev.ui(dt); m |= g_hMPlay.ui(dt); m |= g_hMNext.ui(dt); m |= g_pMPrev.ui(dt); m |= g_pMPlay.ui(dt); m |= g_pMNext.ui(dt);
     m |= g_hLang.ui(dt); m |= g_pLang.ui(dt); m |= g_dragLift.ui(dt);
+    m |= g_focW.lay(dt); m |= g_hFocus.ui(dt); m |= g_hWeather.ui(dt); m |= g_pWeather.ui(dt); m |= g_clockRoll.step(dt, 170.f, 24.f, 0.002f);
+    for (auto& b : g_fb) m |= b.hv.ui(dt);
     m |= g_popA.step(dt, 420.f, 40.f, 0.002f); m |= g_popY.lay(dt);
     for (auto& t : g_tiles) { m |= t.hover.ui(dt); m |= t.closeH.ui(dt); }
     m |= g_cpuV.step(dt, 90.f, 19.f, 0.002f); m |= g_ramV.step(dt, 90.f, 19.f, 0.002f); m |= g_batV.ui(dt);
@@ -1202,6 +1461,11 @@ static void BuildWallpaper(bool force = false) {
             }
             dec->Release();
         }
+    }
+    if (g_cfg.autoAccent) {
+        uint32_t a1, a2; const std::vector<uint32_t>* src = &img; std::vector<uint32_t> solid(1, 0xFF000000u | bg);
+        if (img.empty()) src = &solid;
+        if (DeriveAccent(*src, a1, a2) && (a1 != g_cfg.accent || a2 != g_cfg.accent2)) { g_cfg.accent = a1; g_cfg.accent2 = a2; g_brushDirty = true; }
     }
     std::vector<uint32_t> buf((size_t)sw * sh);
     double baseX = g_winRc.left - g_monRc.left - pad, baseY = g_winRc.top - g_monRc.top - pad;
@@ -1374,6 +1638,10 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
     float leftEnd = g_rStart.right + 6;
     if (g_cfg.stats) { g_rStats = RF(leftEnd, cy - sb / 2, leftEnd + 130, cy + sb / 2); leftEnd = g_rStats.right + 6; }
     else g_rStats = RF(0, 0, 0, 0);
+    { float ft = FocusVisible() ? 86.f : 0.f; if (g_focW.t != ft) { g_focW.t = ft; more = true; } }
+    float fw = std::max(0.f, g_focW.v);
+    g_rFocus = RF(leftEnd, cy - sb / 2, leftEnd + fw, cy + sb / 2);
+    if (fw > 0.5f) leftEnd += fw + 4;
     g_islL = RF(0, 0, leftEnd, H);
     const float gap = islands ? 10.f : 6.f, dockPad = 8.f;
     // ── layout: media island (now playing)
@@ -1394,7 +1662,9 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
     g_rQuick = RF(g_rClock.left - 7 - qw, cy - sb / 2, g_rClock.left - 7, cy + sb / 2);
     if (g_langShow && !g_lang.empty()) g_rLang = RF(g_rQuick.left - 4 - 32, cy - sb / 2, g_rQuick.left - 4, cy + sb / 2);
     else g_rLang = RF(g_rQuick.left, cy, g_rQuick.left, cy);
-    g_islR = RF(g_rLang.left - 6, 0, W, H);
+    if (g_cfg.weather && g_wx.ok) g_rWeather = RF(g_rLang.left - 6 - 58, cy - sb / 2, g_rLang.left - 6, cy + sb / 2);
+    else g_rWeather = RF(g_rLang.left, cy, g_rLang.left, cy);
+    g_islR = RF(g_rWeather.left - 6, 0, W, H);
 
     // ── layout: dock (magnification)
     const float maxIcon = islands ? std::min(40.f, H - 8.f) : std::min(34.f, H - 15.f), maxS = maxIcon / 24.f, dotY = cy + 16.f;
@@ -1470,6 +1740,23 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
             wchar_t pc[16]; swprintf(pc, 16, L"%d%%", (int)lroundf(Clamp01(val[i]) * 100));
             Txt(rt, pc, g_fStatV, RF(sx + 26, cy - 1, sx + 62, cy + 13), Col(1, 1, 1, 0.95f));
         }
+    }
+
+    // ── focus timer chip
+    if (g_focW.v > 2.f) {
+        rt->PushAxisAlignedClip(g_rFocus, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        HoverChip(rt, g_rFocus, g_hFocus.v, 0.f);
+        float rcx = g_rFocus.left + 17.5f; long long rem = FocusRemainMs();
+        bool done = !g_focusOn;
+        float frac = done ? 1.f : (float)rem / (g_cfg.focusMin * 60000.f);
+        if (done) { g_br->SetColor(Hex(0x5BE49B, 0.95f * g_alpha)); ArcStroke(rt, rcx, cy, 9.5f, -90.f, 270.f, 2.6f, g_br); }
+        else Ring(rt, rcx, cy, 9.5f, frac, 2.6f);
+        if (g_focusPaused) { FillRR(rt, RF(rcx - 3.2f, cy - 3.5f, rcx - 1.2f, cy + 3.5f), 0.8f, Col(1, 1, 1, 0.9f)); FillRR(rt, RF(rcx + 1.2f, cy - 3.5f, rcx + 3.2f, cy + 3.5f), 0.8f, Col(1, 1, 1, 0.9f)); }
+        else if (!done) Glyph(rt, L"\xE916", g_fIconS, rcx, cy, 12, Col(1, 1, 1, 0.85f));
+        wchar_t tl[24]; if (done) swprintf(tl, 24, L"Bitti"); else swprintf(tl, 24, L"%lld:%02lld", rem / 60000, (rem / 1000) % 60);
+        Txt(rt, L"Odak", g_fSmall, RF(rcx + 15, cy - 13, g_rFocus.right, cy), Col(1, 1, 1, 0.48f));
+        Txt(rt, tl, g_fStatV, RF(rcx + 15, cy - 1, g_rFocus.right, cy + 13), Col(1, 1, 1, g_focusPaused ? 0.55f : 0.95f));
+        rt->PopAxisAlignedClip();
     }
 
     // ── media island content
@@ -1559,6 +1846,14 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
         rt->PopAxisAlignedClip();
     } else { g_rMInfo = g_rMPrev = g_rMPlay = g_rMNext = RF(0, 0, 0, 0); }
 
+    // ── weather chip
+    if (g_cfg.weather && g_wx.ok) {
+        HoverChip(rt, g_rWeather, g_hWeather.v, g_pWeather.v);
+        DrawWeatherIcon(rt, g_wx.code, g_wx.day, g_rWeather.left + 15, cy, 22);
+        wchar_t t[16]; swprintf(t, 16, L"%ld°", lround(g_wx.temp));
+        Txt(rt, t, g_fStatV, RF(g_rWeather.left + 29, cy - 8, g_rWeather.right, cy + 8), Col(1, 1, 1, 0.92f));
+    }
+
     // ── keyboard layout chip
     if (g_langShow && !g_lang.empty()) {
         HoverChip(rt, g_rLang, g_hLang.v, g_pLang.v);
@@ -1598,7 +1893,13 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
     HoverChip(rt, g_rClock, g_hClock.v, g_pClock.v);
     {
         float cw = g_rClock.right - g_rClock.left;
-        if (g_tlTime) { g_tlTime->SetMaxWidth(cw); TxtL(rt, g_tlTime, g_rClock.left, cy - g_timeH + 1.5f, Col(1, 1, 1, 0.97f)); }
+        float roll = Clamp01(g_clockRoll.v), ty = cy - g_timeH + 1.5f;
+        if (g_tlTimeOld && roll < 0.999f) {
+            rt->PushAxisAlignedClip(RF(g_rClock.left, ty - 1, g_rClock.right, ty + g_timeH + 1), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            g_tlTimeOld->SetMaxWidth(cw); TxtL(rt, g_tlTimeOld, g_rClock.left, ty - 11.f * roll, Col(1, 1, 1, 0.97f * (1.f - roll)));
+            if (g_tlTime) { g_tlTime->SetMaxWidth(cw); TxtL(rt, g_tlTime, g_rClock.left, ty + 11.f * (1.f - roll), Col(1, 1, 1, 0.97f * roll)); }
+            rt->PopAxisAlignedClip();
+        } else if (g_tlTime) { if (g_tlTimeOld && roll >= 0.999f) SafeRelease(g_tlTimeOld); g_tlTime->SetMaxWidth(cw); TxtL(rt, g_tlTime, g_rClock.left, ty, Col(1, 1, 1, 0.97f)); }
         if (g_tlDate) { g_tlDate->SetMaxWidth(cw); TxtL(rt, g_tlDate, g_rClock.left, cy + 1.f, Col(1, 1, 1, 0.52f)); }
     }
     HoverChip(rt, g_rDesk, g_hDesk.v, g_pDesk.v);
@@ -1713,8 +2014,7 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
 }
 
 
-// ───────────────────────────── window preview popup (live DWM thumbnails) ─────────────────────────────
-
+// ───────────────────────────── flyouts: window previews, Control Center, Today ─────────────────────────────
 static void ReleasePopupDevice() {
     SafeRelease(g_popTarget); SafeRelease(g_popVis); SafeRelease(g_popDT); SafeRelease(g_popSwap); g_popSwapW = g_popSwapH = 0;
 }
@@ -1751,16 +2051,30 @@ static bool EnsurePopupDevice() {
     }
     return g_popTarget != nullptr;
 }
+static float CardTop() { return g_cfg.top ? kCaret : 0.f; }
 static void UnregisterTiles() {
     for (auto& t : g_tiles) { if (t.th) DwmUnregisterThumbnail(t.th); SafeRelease(t.tl); }
     g_tiles.clear(); SafeRelease(g_popLabel); g_popHoverTile = g_popPressTile = -1; g_popHoverClose = false;
 }
 static D2D1_RECT_F TileClose(const Tile& t) { return RF(t.r.right - 24, t.r.top + 4, t.r.right - 4, t.r.top + 24); }
+// Places the popup window above (or below) the bar, centred on anchorX (bar-local DIP).
+static void PlacePopup(float anchorX, float gapDip) {
+    const float S = g_scale;
+    g_popPxW = (int)ceilf(g_popW * S); g_popPxH = (int)ceilf((g_popH + kCaret) * S);
+    float ax = g_winRc.left + (g_md + anchorX) * S;
+    int x = (int)(ax - g_popPxW / 2.f);
+    x = std::max((int)g_monRc.left + 8, std::min(x, (int)g_monRc.right - 8 - g_popPxW));
+    g_popCaretX = std::max(20.f, std::min(g_popW - 20.f, (ax - x) / S));
+    int islandTop = g_winRc.top + (int)(g_md * S), islandBot = g_winRc.top + (int)((g_md + g_cfg.height) * S);
+    int y = g_cfg.top ? islandBot + (int)(gapDip * S) : islandTop - (int)(gapDip * S) - g_popPxH;
+    SetWindowPos(g_pop, HWND_TOPMOST, x, y, g_popPxW, g_popPxH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
 static void OpenPopup(AppItem* it) {
     if (!g_cfg.previews || !it || !it->alive || g_dragItem || !g_pop || g_fullscreen) return;
+    if (Sticky() && g_popA.t > 0.5f) return; // a Control Center / Today panel is open
     bool wasShown = g_popShown && g_popA.t > 0.5f;
     UnregisterTiles();
-    g_popItem = it; EnsureName(it);
+    g_popMode = PM_PREVIEW; g_popItem = it; EnsureName(it);
     size_t n = std::min<size_t>(it->wins.size(), 5);
     if (n > 0) {
         for (size_t i = 0; i < n; i++) {
@@ -1780,83 +2094,332 @@ static void OpenPopup(AppItem* it) {
         g_popLabel = Layout(label, g_fTitle, 360.f, &g_popLabelW, &g_popLabelH);
         g_popW = g_popLabelW + 28.f; g_popH = 32.f;
     }
-    const float S = g_scale;
-    g_popPxW = (int)ceilf(g_popW * S); g_popPxH = (int)ceilf(g_popH * S);
-    float iconX = g_winRc.left + (g_md + it->icx) * S;
-    int x = (int)(iconX - g_popPxW / 2.f);
-    x = std::max((int)g_monRc.left + 8, std::min(x, (int)g_monRc.right - 8 - g_popPxW));
-    int islandTop = g_winRc.top + (int)(g_md * S), islandBot = g_winRc.top + (int)((g_md + g_cfg.height) * S);
-    int y = g_cfg.top ? islandBot + (int)(12 * S) : islandTop - (int)(14 * S) - g_popPxH;
-    SetWindowPos(g_pop, HWND_TOPMOST, x, y, g_popPxW, g_popPxH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    if (!wasShown) { g_popA.v = 0; g_popY.v = g_cfg.top ? -8.f : 8.f; g_popY.vel = 0; }
-    g_popA.t = 1; g_popY.t = 0; g_popShown = true;
+    PlacePopup(it->icx, 10.f);
+    if (!wasShown) { g_popA.v = 0; g_popA.vel = 0; }
+    g_popA.t = 1; g_popShown = true;
     Kick();
 }
-static void ClosePopup() { if (g_popShown && g_popA.t != 0) { g_popA.t = 0; g_popY.t = g_cfg.top ? -6.f : 6.f; Kick(); } KillTimer(g_hwnd, TMR_POPUP); }
+static LRESULT CALLBACK FlyMouseHook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN) && Sticky()) {
+        POINT pt = ((MSLLHOOKSTRUCT*)lp)->pt; RECT pr = {}, br = {};
+        GetWindowRect(g_pop, &pr); GetWindowRect(g_hwnd, &br);
+        if (!PtInRect(&pr, pt) && !PtInRect(&br, pt)) PostMessageW(g_hwnd, WM_CLOSEFLY, 0, 0);
+    }
+    return CallNextHookEx(g_mouseHook, code, wp, lp);
+}
+static float TodayHeight() {
+    float h = 78.f;
+    if (g_cfg.weather) h += g_wx.ok ? 126.f : 30.f;
+    return h + 30.f + 20.f + 6 * 30.f + 6.f + 34.f;
+}
+static void OpenFlyout(int mode, float anchorX) {
+    if (!g_pop || g_fullscreen) return;
+    bool same = g_popShown && g_popMode == mode && g_popA.t > 0.5f;
+    UnregisterTiles(); g_popItem = nullptr;
+    g_popMode = mode; g_fbHover = g_fbPress = -1; g_armId = -1; g_volDrag = false;
+    if (!same) g_fb.clear();
+    if (mode == PM_CONTROL) { g_popW = 340.f; g_popH = 344.f; g_dark = IsDarkMode(); }
+    else { SYSTEMTIME st; GetLocalTime(&st); g_calY = st.wYear; g_calM = st.wMonth; g_popW = 304.f; g_popH = TodayHeight(); if (g_cfg.weather && !g_wx.ok) WeatherTick(true); }
+    PlacePopup(anchorX, 8.f);
+    if (!same) { g_popA.v = 0; g_popA.vel = 0; }
+    g_popA.t = 1; g_popShown = true;
+    if (!g_mouseHook) g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, FlyMouseHook, GetModuleHandleW(nullptr), 0);
+    KillTimer(g_hwnd, TMR_POPUP); KillTimer(g_hwnd, TMR_POPHIDE);
+    Kick();
+}
+static void ClosePopup() { if (g_popShown && g_popA.t != 0) { g_popA.t = 0; Kick(); } KillTimer(g_hwnd, TMR_POPUP); g_volDrag = false; }
 static void ClosePopupNow() {
     UnregisterTiles(); if (g_pop) ShowWindow(g_pop, SW_HIDE);
-    g_popShown = false; g_popItem = nullptr; g_popA.snap(0); g_popY.snap(0); g_popTracking = false;
+    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+    g_popShown = false; g_popItem = nullptr; g_popA.snap(0); g_popTracking = false; g_volDrag = false; g_armId = -1;
 }
 static void PopupSync() {
-    if (!g_popShown || !g_popItem) return;
+    if (!g_popShown || g_popMode != PM_PREVIEW || !g_popItem) return;
     if (!g_popItem->alive) { ClosePopup(); return; }
     size_t n = std::min<size_t>(g_popItem->wins.size(), 5);
     bool same = n == g_tiles.size();
     for (size_t i = 0; same && i < n; i++) if (g_tiles[i].w != g_popItem->wins[i]) same = false;
     if (!same && g_popA.t > 0.5f) OpenPopup(g_popItem);
 }
-static void RenderPopup() {
-    if (!g_popShown || !EnsurePopupDevice()) return;
-    const float S = g_scale, a = Clamp01(g_popA.v), oy = 0.f;
-    const float psc = 0.94f + 0.06f * a, pvx = g_popW * 0.5f, pvy = g_cfg.top ? 0.f : g_popH;
-    g_dc->SetTarget(g_popTarget); g_dc->SetDpi(96.f * S, 96.f * S);
-    g_dc->BeginDraw();
-    g_dc->Clear(Col(0, 0, 0, 0));
-    g_alpha = a; g_dc->SetTransform(MRotScale(0, psc, pvx, pvy));
-    D2D1_RECT_F card = RF(0.5f, 0.5f, g_popW - 0.5f, g_popH - 0.5f);
-    float rad = g_tiles.empty() ? 11.f : 14.f;
-    FillRR(g_dc, card, rad, Hex(0x17181F, 0.97f));
-    if (g_acc && !g_tiles.empty()) { // faint accent wash at the top
-        D2D1_RECT_F top = RF(card.left, card.top, card.right, card.top + 30);
-        g_acc->SetStartPoint(PT(card.left, card.top)); g_acc->SetEndPoint(PT(card.right, card.top)); g_acc->SetOpacity(0.06f * a);
-        D2D1_ROUNDED_RECT rr = {top, rad, rad}; g_dc->FillRoundedRectangle(&rr, g_acc);
+
+// ── flyout widgets
+static FlyBtn& Btn(int id, D2D1_RECT_F r) {
+    for (auto& b : g_fb) if (b.id == id) { b.r = r; b.seen = true; return b; }
+    FlyBtn b; b.id = id; b.r = r; b.seen = true; g_fb.push_back(b); return g_fb.back();
+}
+static void Glyph(ID2D1RenderTarget* rt, const wchar_t* g, IDWriteTextFormat* f, float cx, float cy, float box, D2D1_COLOR_F c) {
+    Txt(rt, g, f, RF(cx - box / 2, cy - box / 2, cx + box / 2, cy + box / 2), c);
+}
+static void DrawContrastIcon(ID2D1RenderTarget* rt, float cx, float cy, float r, D2D1_COLOR_F c) {
+    g_br->SetColor(Col(c.r, c.g, c.b, c.a * g_alpha));
+    D2D1_ELLIPSE e = {PT(cx, cy), r, r}; rt->DrawEllipse(&e, g_br, 1.6f, nullptr);
+    ID2D1PathGeometry* g = nullptr;
+    if (SUCCEEDED(g_d2d->CreatePathGeometry(&g)) && g) {
+        ID2D1GeometrySink* s = nullptr;
+        if (SUCCEEDED(g->Open(&s)) && s) {
+            s->BeginFigure(PT(cx, cy - r), D2D1_FIGURE_BEGIN_FILLED);
+            D2D1_ARC_SEGMENT a = {PT(cx, cy + r), {r, r}, 0.f, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL};
+            s->AddArc(&a); s->EndFigure(D2D1_FIGURE_END_CLOSED); s->Close(); s->Release();
+            rt->FillGeometry(g, g_br, nullptr);
+        }
+        g->Release();
     }
-    if (g_sheen) { g_sheen->SetStartPoint(PT(0, card.top)); g_sheen->SetEndPoint(PT(0, card.top + 40)); g_sheen->SetOpacity(a); D2D1_ROUNDED_RECT rr = {card, rad, rad}; g_dc->FillRoundedRectangle(&rr, g_sheen); }
-    if (g_rim) { g_rim->SetStartPoint(PT(0, card.top)); g_rim->SetEndPoint(PT(0, card.bottom)); g_rim->SetOpacity(a); D2D1_ROUNDED_RECT rr = {card, rad, rad}; g_dc->DrawRoundedRectangle(&rr, g_rim, 1.f, nullptr); }
-    if (g_tiles.empty() && g_popLabel) TxtL(g_dc, g_popLabel, 14.f, (g_popH - g_popLabelH) / 2.f, Col(1, 1, 1, 0.95f));
+}
+static void DrawCloud(ID2D1RenderTarget* rt, float cx, float cy, float s, D2D1_COLOR_F c) {
+    g_br->SetColor(Col(c.r, c.g, c.b, c.a * g_alpha));
+    D2D1_ROUNDED_RECT base = {RF(cx - s * 0.38f, cy - s * 0.02f, cx + s * 0.38f, cy + s * 0.2f), s * 0.11f, s * 0.11f};
+    rt->FillRoundedRectangle(&base, g_br);
+    D2D1_ELLIPSE e1 = {PT(cx - s * 0.17f, cy - s * 0.02f), s * 0.16f, s * 0.16f}; rt->FillEllipse(&e1, g_br);
+    D2D1_ELLIPSE e2 = {PT(cx + s * 0.06f, cy - s * 0.1f), s * 0.22f, s * 0.22f}; rt->FillEllipse(&e2, g_br);
+}
+static void DrawSun(ID2D1RenderTarget* rt, float cx, float cy, float s) {
+    g_br->SetColor(Hex(0xFFC94D, g_alpha)); float r = s * 0.2f;
+    D2D1_ELLIPSE e = {PT(cx, cy), r, r}; rt->FillEllipse(&e, g_br);
+    for (int i = 0; i < 8; i++) { float a = i * 3.14159f / 4.f; rt->DrawLine(PT(cx + cosf(a) * r * 1.45f, cy + sinf(a) * r * 1.45f), PT(cx + cosf(a) * r * 2.0f, cy + sinf(a) * r * 2.0f), g_br, s * 0.055f, g_round); }
+}
+static void DrawMoon(ID2D1RenderTarget* rt, float cx, float cy, float s) {
+    ID2D1EllipseGeometry *a = nullptr, *b = nullptr; ID2D1PathGeometry* p = nullptr;
+    D2D1_ELLIPSE ea = {PT(cx, cy), s * 0.24f, s * 0.24f}, eb = {PT(cx + s * 0.12f, cy - s * 0.08f), s * 0.2f, s * 0.2f};
+    if (SUCCEEDED(g_d2d->CreateEllipseGeometry(&ea, &a)) && SUCCEEDED(g_d2d->CreateEllipseGeometry(&eb, &b)) && SUCCEEDED(g_d2d->CreatePathGeometry(&p))) {
+        ID2D1GeometrySink* sk = nullptr;
+        if (SUCCEEDED(p->Open(&sk)) && sk) { a->CombineWithGeometry(b, D2D1_COMBINE_MODE_EXCLUDE, nullptr, sk); sk->Close(); sk->Release(); g_br->SetColor(Hex(0xF1E7C2, g_alpha)); rt->FillGeometry(p, g_br, nullptr); }
+    }
+    SafeRelease(p); SafeRelease(b); SafeRelease(a);
+}
+static void DrawWeatherIcon(ID2D1RenderTarget* rt, int code, bool day, float cx, float cy, float s) {
+    int k = WKind(code);
+    if (k == 0) { if (day) DrawSun(rt, cx, cy, s); else DrawMoon(rt, cx, cy, s); return; }
+    if (k == 3) { for (int i = 0; i < 3; i++) Line(rt, cx - s * 0.32f + i * s * 0.05f, cy - s * 0.12f + i * s * 0.14f, cx + s * 0.32f - i * s * 0.03f, cy - s * 0.12f + i * s * 0.14f, s * 0.07f, Col(0.85f, 0.88f, 0.93f, 0.9f)); return; }
+    if (k == 1) { if (day) DrawSun(rt, cx - s * 0.14f, cy - s * 0.14f, s * 0.8f); else DrawMoon(rt, cx - s * 0.12f, cy - s * 0.12f, s * 0.8f); }
+    float ccy = cy + (k == 1 || k == 2 ? s * 0.06f : -s * 0.04f);
+    DrawCloud(rt, cx + (k == 1 ? s * 0.06f : 0.f), ccy, s, k == 7 ? Col(0.62f, 0.65f, 0.72f, 1.f) : Col(0.91f, 0.93f, 0.97f, 1.f));
+    float by = ccy + s * 0.3f;
+    if (k == 4 || k == 5) { int n = k == 5 ? 3 : 3; for (int i = 0; i < n; i++) { float x = cx - s * 0.18f + i * s * 0.18f; Line(rt, x, by, x - s * 0.06f, by + s * (k == 5 ? 0.18f : 0.08f), s * 0.06f, Hex(0x7FB2FF, 0.95f)); } }
+    if (k == 6) { g_br->SetColor(Col(1, 1, 1, 0.95f * g_alpha)); for (int i = 0; i < 3; i++) { D2D1_ELLIPSE e = {PT(cx - s * 0.18f + i * s * 0.18f, by + s * 0.06f), s * 0.045f, s * 0.045f}; rt->FillEllipse(&e, g_br); } }
+    if (k == 7) {
+        ID2D1PathGeometry* g = nullptr;
+        if (SUCCEEDED(g_d2d->CreatePathGeometry(&g)) && g) {
+            ID2D1GeometrySink* sk = nullptr;
+            if (SUCCEEDED(g->Open(&sk)) && sk) {
+                D2D1_POINT_2F p[5] = {PT(cx + s * 0.02f, by - s * 0.04f), PT(cx - s * 0.1f, by + s * 0.14f), PT(cx, by + s * 0.14f), PT(cx - s * 0.06f, by + s * 0.3f), PT(cx + s * 0.12f, by + s * 0.08f)};
+                sk->BeginFigure(p[0], D2D1_FIGURE_BEGIN_FILLED); sk->AddLines(p + 1, 4); sk->EndFigure(D2D1_FIGURE_END_CLOSED); sk->Close(); sk->Release();
+                g_br->SetColor(Hex(0xFFD54A, g_alpha)); rt->FillGeometry(g, g_br, nullptr);
+            }
+            g->Release();
+        }
+    }
+}
+
+static void DrawControl(ID2D1RenderTarget* rt) {
+    const float W = g_popW;
+    Txt(rt, L"Kontrol Merkezi", g_fMid, RF(16, 10, 220, 34), Col(1, 1, 1, 0.96f));
+    Txt(rt, L"\x2193 " + FmtRate(g_netDown) + L"   \x2191 " + FmtRate(g_netUp), g_fSmallR, RF(W - 220, 12, W - 16, 32), Col(1, 1, 1, 0.55f));
+    // volume card
+    D2D1_RECT_F vc = RF(14, 42, W - 14, 90);
+    FillRR(rt, vc, 13.f, Col(1, 1, 1, 0.055f));
+    FlyBtn& mb = Btn(FB_MUTE, RF(20, 46, 60, 86));
+    if (mb.hv.v > 0.01f) { g_br->SetColor(Col(1, 1, 1, 0.09f * mb.hv.v * g_alpha)); D2D1_ELLIPSE e = {PT(40, 66), 17.f, 17.f}; rt->FillEllipse(&e, g_br); }
+    DrawSpeaker(rt, 42, 66, g_vol, g_mute, 0.95f);
+    g_volTrack = RF(64, 52, W - 58, 80);
+    Btn(FB_VOL, g_volTrack);
+    D2D1_RECT_F tr = RF(72, 64, W - 66, 68);
+    FillRR(rt, tr, 2.f, Col(1, 1, 1, 0.13f));
+    float v = Clamp01(g_volV.v), kx = tr.left + (tr.right - tr.left) * v;
+    if (kx - tr.left > 0.5f) FillAcc(rt, RF(tr.left, tr.top, kx, tr.bottom), 2.f, g_mute ? 0.35f : 1.f);
+    FillRR(rt, RF(kx - 8, 58, kx + 8, 74), 8.f, Col(0, 0, 0, 0.28f));
+    FillRR(rt, RF(kx - 7, 59, kx + 7, 73), 7.f, Col(1, 1, 1, 0.98f));
+    wchar_t pc[8]; swprintf(pc, 8, L"%d", (int)lroundf(Clamp01(g_vol) * 100));
+    Txt(rt, pc, g_fStatC, RF(W - 58, 54, W - 20, 78), Col(1, 1, 1, 0.9f));
+    // tiles
+    struct T { int id; const wchar_t* g; std::wstring label; bool on; };
+    wchar_t fl[16];
+    long long rem = FocusRemainMs(); swprintf(fl, 16, L"%lld:%02lld", rem / 60000, (rem / 1000) % 60);
+    std::wstring focusLabel = g_focusOn ? std::wstring(fl) : L"Odak " + std::to_wstring(g_cfg.focusMin) + L" dk";
+    T tiles[8] = {{FB_DARK, nullptr, L"Karanlık mod", g_dark}, {FB_FOCUS, L"\xE916", focusLabel, g_focusOn},
+                  {FB_SNIP, L"\xE8C6", L"Alıntı", false}, {FB_CLIP, L"\xE77F", L"Pano", false},
+                  {FB_EMOJI, L"\xE76E", L"Emoji", false}, {FB_WIFI, nullptr, L"Wi-Fi", false},
+                  {FB_BT, L"\xE702", L"Bluetooth", false}, {FB_SETTINGS, L"\xE713", L"Ayarlar", false}};
+    const float tw = (W - 28 - 24) / 4.f, th = 64.f, ty0 = 102.f;
+    for (int i = 0; i < 8; i++) {
+        float x = 14 + (i % 4) * (tw + 8), y = ty0 + (i / 4) * (th + 8);
+        FlyBtn& b = Btn(tiles[i].id, RF(x, y, x + tw, y + th));
+        float hv = b.hv.v;
+        if (tiles[i].on) { FillAcc(rt, b.r, 13.f, 0.95f); FillRR(rt, RF(b.r.left, b.r.top, b.r.right, b.r.top + th / 2), 13.f, Col(1, 1, 1, 0.10f)); }
+        else FillRR(rt, b.r, 13.f, Col(1, 1, 1, 0.06f + 0.06f * hv));
+        StrokeRR(rt, RF(b.r.left + 0.5f, b.r.top + 0.5f, b.r.right - 0.5f, b.r.bottom - 0.5f), 12.5f, Col(1, 1, 1, 0.06f + 0.06f * hv));
+        float gx = (b.r.left + b.r.right) / 2, gy = y + 25 - 1.5f * hv;
+        D2D1_COLOR_F gc = Col(1, 1, 1, 0.95f);
+        if (tiles[i].id == FB_DARK) DrawContrastIcon(rt, gx, gy, 8.f, gc);
+        else if (tiles[i].id == FB_WIFI) DrawWifi(rt, gx, gy - 1, 0.95f);
+        else Glyph(rt, tiles[i].g, g_fIconL, gx, gy, 24, gc);
+        Txt(rt, tiles[i].label, g_fSmallC, RF(b.r.left + 2, y + 42, b.r.right - 2, y + 58), Col(1, 1, 1, tiles[i].on ? 1.f : 0.82f));
+    }
+    // power row
+    struct PW { int id; const wchar_t* g; const wchar_t* label; };
+    PW pw[4] = {{FB_LOCK, L"\xE72E", L"Kilitle"}, {FB_SLEEP, L"\xE708", L"Uyku"}, {FB_RESTART, L"\xE72C", L"Yeniden başlat"}, {FB_SHUTDOWN, L"\xE7E8", L"Bilgisayarı kapat"}};
+    float py = 252.f, pr = 20.f, span = (W - 28) / 4.f;
+    std::wstring status;
+    if (g_armId > 0 && GetTickCount64() - g_armTime > 3500) g_armId = -1;
+    for (int i = 0; i < 4; i++) {
+        float cx = 14 + span * (i + 0.5f), cy = py + pr;
+        FlyBtn& b = Btn(pw[i].id, RF(cx - pr - 6, py - 4, cx + pr + 6, py + 2 * pr + 4));
+        bool armed = g_armId == pw[i].id;
+        g_br->SetColor(armed ? Hex(0xE5484D, 0.92f * g_alpha) : Col(1, 1, 1, (0.07f + 0.08f * b.hv.v) * g_alpha));
+        D2D1_ELLIPSE e = {PT(cx, cy), pr, pr}; rt->FillEllipse(&e, g_br);
+        Glyph(rt, pw[i].g, g_fIconL, cx, cy, 24, Col(1, 1, 1, 0.95f));
+        if (b.hv.v > 0.5f) status = pw[i].label;
+    }
+    if (g_armId == FB_RESTART || g_armId == FB_SHUTDOWN) status = L"Emin misin? Onaylamak için tekrar tıkla.";
+    Txt(rt, status, g_fSmallC, RF(14, py + 2 * pr + 8, W - 14, py + 2 * pr + 24), Col(1, 1, 1, g_armId > 0 ? 0.95f : 0.6f));
+    // footer
+    FlyBtn& q = Btn(FB_QUICK, RF(14, g_popH - 34, W - 14, g_popH - 10));
+    FillRR(rt, q.r, 9.f, Col(1, 1, 1, 0.05f * q.hv.v));
+    Txt(rt, L"Windows Hızlı Ayarlar  \x203A", g_fSmallC, q.r, Col(1, 1, 1, 0.55f + 0.35f * q.hv.v));
+}
+static int DaysIn(int y, int m) { static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}; return m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 29 : d[m - 1]; }
+static int Weekday(int y, int m, int d) { // 0 = Monday
+    SYSTEMTIME st = {}; st.wYear = (WORD)y; st.wMonth = (WORD)m; st.wDay = (WORD)d; FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft) || !FileTimeToSystemTime(&ft, &st)) return 0;
+    return (st.wDayOfWeek + 6) % 7;
+}
+static void DrawToday(ID2D1RenderTarget* rt) {
+    const float W = g_popW;
+    Txt(rt, g_timeStr, g_fBig, RF(16, 6, W - 16, 52), Col(1, 1, 1, 0.97f));
+    Txt(rt, g_dateLong, g_fTile, RF(17, 50, W - 16, 68), Col(1, 1, 1, 0.6f));
+    float y = 78.f;
+    if (g_cfg.weather) {
+        if (g_wx.ok) {
+            D2D1_RECT_F c = RF(14, y, W - 14, y + 116);
+            FillRR(rt, c, 14.f, Col(1, 1, 1, 0.055f));
+            DrawWeatherIcon(rt, g_wx.code, g_wx.day, 44, y + 32, 40);
+            wchar_t t[16]; swprintf(t, 16, L"%ld°", lround(g_wx.temp));
+            Txt(rt, t, g_fBig, RF(72, y + 6, 160, y + 56), Col(1, 1, 1, 0.97f));
+            Txt(rt, WDesc(g_wx.code), g_fTitle, RF(150, y + 12, W - 22, y + 30), Col(1, 1, 1, 0.92f));
+            wchar_t hl[96]; swprintf(hl, 96, L"%ls  \x2191%ld° \x2193%ld°", g_wx.city.c_str(), lround(g_wx.tmax), lround(g_wx.tmin));
+            Txt(rt, hl, g_fTile, RF(150, y + 30, W - 22, y + 48), Col(1, 1, 1, 0.55f));
+            float cw = (W - 40) / 6.f;
+            for (int i = 0; i < g_wx.hn && i < 6; i++) {
+                float cx = 20 + cw * (i + 0.5f);
+                wchar_t hh[8]; swprintf(hh, 8, L"%02d", g_wx.hour[i]);
+                Txt(rt, hh, g_fSmallC, RF(cx - 18, y + 62, cx + 18, y + 76), Col(1, 1, 1, 0.5f));
+                DrawWeatherIcon(rt, g_wx.hcode[i], g_wx.hour[i] >= 7 && g_wx.hour[i] < 19, cx, y + 87, 18);
+                wchar_t ht[8]; swprintf(ht, 8, L"%ld°", lround(g_wx.htemp[i]));
+                Txt(rt, ht, g_fSmallC, RF(cx - 18, y + 97, cx + 18, y + 112), Col(1, 1, 1, 0.88f));
+            }
+            y += 126.f;
+        } else {
+            Txt(rt, g_wxBusy ? L"Hava durumu alınıyor…" : (L"Hava durumu alınamadı (" + g_cfg.city + L")"), g_fTile, RF(17, y, W - 16, y + 20), Col(1, 1, 1, 0.5f));
+            y += 30.f;
+        }
+    }
+    static const wchar_t* months[] = {L"Ocak", L"Şubat", L"Mart", L"Nisan", L"Mayıs", L"Haziran", L"Temmuz", L"Ağustos", L"Eylül", L"Ekim", L"Kasım", L"Aralık"};
+    Txt(rt, std::wstring(months[g_calM - 1]) + L" " + std::to_wstring(g_calY), g_fMid, RF(17, y, W - 90, y + 24), Col(1, 1, 1, 0.95f));
+    FlyBtn& bp = Btn(FB_CALPREV, RF(W - 80, y - 2, W - 50, y + 26));
+    FlyBtn& bn = Btn(FB_CALNEXT, RF(W - 46, y - 2, W - 16, y + 26));
+    for (FlyBtn* b : {&bp, &bn}) {
+        g_br->SetColor(Col(1, 1, 1, (0.04f + 0.08f * b->hv.v) * g_alpha));
+        D2D1_ELLIPSE e = {PT((b->r.left + b->r.right) / 2, y + 12), 13.f, 13.f}; rt->FillEllipse(&e, g_br);
+        float cx = (b->r.left + b->r.right) / 2, d = b->id == FB_CALPREV ? 1.f : -1.f;
+        Line(rt, cx + 2 * d, y + 7, cx - 2.5f * d, y + 12, 1.6f, Col(1, 1, 1, 0.9f));
+        Line(rt, cx - 2.5f * d, y + 12, cx + 2 * d, y + 17, 1.6f, Col(1, 1, 1, 0.9f));
+    }
+    y += 30.f;
+    static const wchar_t* wd[] = {L"Pt", L"Sa", L"Ça", L"Pe", L"Cu", L"Ct", L"Pz"};
+    const float cw = (W - 28) / 7.f;
+    for (int i = 0; i < 7; i++) Txt(rt, wd[i], g_fSmallC, RF(14 + i * cw, y, 14 + (i + 1) * cw, y + 16), Col(1, 1, 1, i >= 5 ? 0.38f : 0.5f));
+    y += 20.f;
+    SYSTEMTIME now; GetLocalTime(&now);
+    int first = Weekday(g_calY, g_calM, 1), dim = DaysIn(g_calY, g_calM);
+    int pm = g_calM == 1 ? 12 : g_calM - 1, py = g_calM == 1 ? g_calY - 1 : g_calY, pdim = DaysIn(py, pm);
+    for (int cell = 0; cell < 42; cell++) {
+        int day = cell - first + 1; bool inMonth = day >= 1 && day <= dim;
+        int shown = inMonth ? day : (day < 1 ? pdim + day : day - dim);
+        float cx = 14 + (cell % 7 + 0.5f) * cw, cy = y + (cell / 7) * 30.f + 14.f;
+        bool today = inMonth && g_calY == now.wYear && g_calM == now.wMonth && day == now.wDay;
+        if (today && g_acc) {
+            g_acc->SetStartPoint(PT(cx - 13, cy - 13)); g_acc->SetEndPoint(PT(cx + 13, cy + 13)); g_acc->SetOpacity(g_alpha);
+            D2D1_ELLIPSE e = {PT(cx, cy), 13.f, 13.f}; rt->FillEllipse(&e, g_acc);
+        }
+        wchar_t ds[4]; swprintf(ds, 4, L"%d", shown);
+        float a = !inMonth ? 0.22f : (cell % 7 >= 5 ? 0.6f : 0.9f);
+        Txt(rt, ds, g_fCal, RF(cx - 15, cy - 10, cx + 15, cy + 10), Col(1, 1, 1, today ? 1.f : a));
+    }
+    FlyBtn& nb = Btn(FB_NOTIF, RF(14, g_popH - 34, W - 14, g_popH - 10));
+    FillRR(rt, nb.r, 9.f, Col(1, 1, 1, 0.05f * nb.hv.v));
+    Txt(rt, L"Bildirimler ve Windows takvimi  \x203A", g_fSmallC, nb.r, Col(1, 1, 1, 0.55f + 0.35f * nb.hv.v));
+}
+static void DrawPreview(ID2D1RenderTarget* rt) {
+    if (g_tiles.empty() && g_popLabel) TxtL(rt, g_popLabel, 14.f, (g_popH - g_popLabelH) / 2.f, Col(1, 1, 1, 0.95f));
     for (auto& t : g_tiles) {
         float hv = Clamp01(t.hover.v);
-        FillRR(g_dc, t.r, 10.f, Col(1, 1, 1, 0.04f + 0.07f * hv));
-        if (hv > 0.01f) StrokeRR(g_dc, RF(t.r.left + 0.5f, t.r.top + 0.5f, t.r.right - 0.5f, t.r.bottom - 0.5f), 9.5f, Col(1, 1, 1, 0.10f * hv));
-        // header: app icon + title
-        if (g_popItem && g_popItem->bmp) Bitmap(g_dc, g_popItem->bmp, RF(t.r.left + 8, t.r.top + 4, t.r.left + 22, t.r.top + 18), 1.f);
-        if (t.tl) TxtL(g_dc, t.tl, t.r.left + 27, t.r.top + 3.5f, Col(1, 1, 1, 0.88f));
-        FillRR(g_dc, t.area, 6.f, Col(0, 0, 0, 0.28f));
+        FillRR(rt, t.r, 10.f, Col(1, 1, 1, 0.04f + 0.07f * hv));
+        if (hv > 0.01f) StrokeRR(rt, RF(t.r.left + 0.5f, t.r.top + 0.5f, t.r.right - 0.5f, t.r.bottom - 0.5f), 9.5f, Col(1, 1, 1, 0.10f * hv));
+        if (g_popItem && g_popItem->bmp) Bitmap(rt, g_popItem->bmp, RF(t.r.left + 8, t.r.top + 4, t.r.left + 22, t.r.top + 18), 1.f);
+        if (t.tl) TxtL(rt, t.tl, t.r.left + 27, t.r.top + 3.5f, Col(1, 1, 1, 0.88f));
+        FillRR(rt, t.area, 6.f, Col(0, 0, 0, 0.28f));
         if ((t.iconic || !t.th) && g_popItem && g_popItem->bmp) {
             float cx = (t.area.left + t.area.right) / 2, cy = (t.area.top + t.area.bottom) / 2;
-            Bitmap(g_dc, g_popItem->bmp, RF(cx - 20, cy - 20, cx + 20, cy + 20), 0.9f);
+            Bitmap(rt, g_popItem->bmp, RF(cx - 20, cy - 20, cx + 20, cy + 20), 0.9f);
         }
         if (hv > 0.01f) {
             D2D1_RECT_F c = TileClose(t); float ch = Clamp01(t.closeH.v), ccx = (c.left + c.right) / 2, ccy = (c.top + c.bottom) / 2;
-            g_br->SetColor(ch > 0.01f ? Hex(0xFF5F57, (0.85f + 0.15f * ch) * hv * a) : Col(1, 1, 1, 0.14f * hv * a));
-            D2D1_ELLIPSE e = {PT(ccx, ccy), 8.f, 8.f}; g_dc->FillEllipse(&e, g_br);
-            Line(g_dc, ccx - 3, ccy - 3, ccx + 3, ccy + 3, 1.4f, Col(1, 1, 1, 0.95f * hv));
-            Line(g_dc, ccx + 3, ccy - 3, ccx - 3, ccy + 3, 1.4f, Col(1, 1, 1, 0.95f * hv));
+            g_br->SetColor(ch > 0.01f ? Hex(0xFF5F57, (0.85f + 0.15f * ch) * hv * g_alpha) : Col(1, 1, 1, 0.14f * hv * g_alpha));
+            D2D1_ELLIPSE e = {PT(ccx, ccy), 8.f, 8.f}; rt->FillEllipse(&e, g_br);
+            Line(rt, ccx - 3, ccy - 3, ccx + 3, ccy + 3, 1.4f, Col(1, 1, 1, 0.95f * hv));
+            Line(rt, ccx + 3, ccy - 3, ccx - 3, ccy + 3, 1.4f, Col(1, 1, 1, 0.95f * hv));
         }
     }
+}
+static void RenderPopup() {
+    if (!g_popShown || !EnsurePopupDevice()) return;
+    const float S = g_scale, a = Clamp01(g_popA.v), ct = CardTop();
+    const float psc = 0.94f + 0.06f * a, pvx = g_popCaretX, pvy = g_cfg.top ? 0.f : g_popH + kCaret;
+    for (auto& b : g_fb) b.seen = false;
+    g_dc->SetTarget(g_popTarget); g_dc->SetDpi(96.f * S, 96.f * S);
+    g_dc->BeginDraw();
+    g_dc->Clear(Col(0, 0, 0, 0));
+    g_alpha = a;
+    const D2D1_MATRIX_3X2_F base = MRotScale(0, psc, pvx, pvy);
+    g_dc->SetTransform(base);
+    D2D1_RECT_F card = RF(0.5f, ct + 0.5f, g_popW - 0.5f, ct + g_popH - 0.5f);
+    float rad = (g_popMode == PM_PREVIEW && g_tiles.empty()) ? 11.f : 16.f;
+    D2D1_ROUNDED_RECT rr = {card, rad, rad};
+    FillRR(g_dc, card, rad, Hex(0x15161D, 0.975f));
+    if (g_acc && !(g_popMode == PM_PREVIEW && g_tiles.empty())) {
+        g_acc->SetStartPoint(PT(card.left, card.top)); g_acc->SetEndPoint(PT(card.right, card.top)); g_acc->SetOpacity(0.07f * a);
+        D2D1_ROUNDED_RECT top = {RF(card.left, card.top, card.right, card.top + 40), rad, rad}; g_dc->FillRoundedRectangle(&top, g_acc);
+    }
+    if (g_sheen) { g_sheen->SetStartPoint(PT(0, card.top)); g_sheen->SetEndPoint(PT(0, card.top + 44)); g_sheen->SetOpacity(a); g_dc->FillRoundedRectangle(&rr, g_sheen); }
+    if (g_rim) { g_rim->SetStartPoint(PT(0, card.top)); g_rim->SetEndPoint(PT(0, card.bottom)); g_rim->SetOpacity(a); g_dc->DrawRoundedRectangle(&rr, g_rim, 1.f, nullptr); }
+    { // caret pointing at what opened the flyout
+        float cx = g_popCaretX, by = g_cfg.top ? card.top + 0.5f : card.bottom - 0.5f, d = g_cfg.top ? -1.f : 1.f;
+        ID2D1PathGeometry* g = nullptr;
+        if (SUCCEEDED(g_d2d->CreatePathGeometry(&g)) && g) {
+            ID2D1GeometrySink* sk = nullptr;
+            if (SUCCEEDED(g->Open(&sk)) && sk) {
+                D2D1_POINT_2F p[3] = {PT(cx - kCaret - 1.5f, by - d), PT(cx, by + d * (kCaret - 0.5f)), PT(cx + kCaret + 1.5f, by - d)};
+                sk->BeginFigure(p[0], D2D1_FIGURE_BEGIN_FILLED); sk->AddLines(p + 1, 2); sk->EndFigure(D2D1_FIGURE_END_OPEN); sk->Close(); sk->Release();
+                g_br->SetColor(Hex(0x15161D, 0.975f * a)); g_dc->FillGeometry(g, g_br, nullptr);
+                g_br->SetColor(Col(1, 1, 1, 0.05f * a)); g_dc->DrawGeometry(g, g_br, 1.f, nullptr);
+            }
+            g->Release();
+        }
+    }
+    g_dc->SetTransform(MMul(MTrans(0, ct), base));
+    if (g_popMode == PM_CONTROL) DrawControl(g_dc);
+    else if (g_popMode == PM_TODAY) DrawToday(g_dc);
+    else DrawPreview(g_dc);
     g_dc->SetTransform(MIdent());
     HRESULT hr = g_dc->EndDraw();
     g_alpha = 1.f;
     if (SUCCEEDED(hr)) g_popSwap->Present(0, 0);
     g_dc->SetTarget(g_target);
-    // live thumbnails, aspect-fit into each tile
     for (auto& t : g_tiles) {
         if (!t.th) continue;
         float aw = t.area.right - t.area.left - 4, ah = t.area.bottom - t.area.top - 4;
         float sw = (float)std::max<LONG>(1, t.src.cx), sh = (float)std::max<LONG>(1, t.src.cy);
-        float sc = std::min(aw / sw, ah / sh), dw = sw * sc, dh = sh * sc;
-        float cx = pvx + ((t.area.left + t.area.right) / 2 - pvx) * psc, cy = pvy + ((t.area.top + t.area.bottom) / 2 - pvy) * psc + oy;
-        dw *= psc; dh *= psc;
+        float sc = std::min(aw / sw, ah / sh), dw = sw * sc * psc, dh = sh * sc * psc;
+        float cx = pvx + ((t.area.left + t.area.right) / 2 - pvx) * psc, cy = pvy + ((t.area.top + t.area.bottom) / 2 + ct - pvy) * psc;
         DWM_THUMBNAIL_PROPERTIES p = {};
         p.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY;
         p.rcDestination = RECT{(LONG)((cx - dw / 2) * S), (LONG)((cy - dh / 2) * S), (LONG)((cx + dw / 2) * S), (LONG)((cy + dh / 2) * S)};
@@ -1864,37 +2427,89 @@ static void RenderPopup() {
         DwmUpdateThumbnailProperties(t.th, &p);
     }
 }
+static void SetVolumeAbs(float v);
+static void FlyAction(int id) {
+    ULONGLONG now = GetTickCount64();
+    switch (id) {
+    case FB_MUTE: if (g_epv) { g_mute = !g_mute; g_epv->SetMute(g_mute, nullptr); } break;
+    case FB_DARK: g_dark = !g_dark; SetDarkMode(g_dark); break;
+    case FB_FOCUS: if (g_focusOn) StopFocus(); else StartFocus(); break;
+    case FB_SNIP: ClosePopupNow(); SendKeys({VK_LWIN, VK_SHIFT, 'S'}); break;
+    case FB_CLIP: ClosePopupNow(); SendKeys({VK_LWIN, 'V'}); break;
+    case FB_EMOJI: ClosePopupNow(); SendKeys({VK_LWIN, VK_OEM_PERIOD}); break;
+    case FB_WIFI: ClosePopup(); ShellExecuteW(nullptr, L"open", L"ms-settings:network-wifi", nullptr, nullptr, SW_SHOWNORMAL); break;
+    case FB_BT: ClosePopup(); ShellExecuteW(nullptr, L"open", L"ms-settings:bluetooth", nullptr, nullptr, SW_SHOWNORMAL); break;
+    case FB_SETTINGS: ClosePopup(); ShellExecuteW(nullptr, L"open", L"ms-settings:", nullptr, nullptr, SW_SHOWNORMAL); break;
+    case FB_LOCK: ClosePopupNow(); LockWorkStation(); break;
+    case FB_SLEEP: ClosePopupNow(); SetSuspendState(FALSE, FALSE, FALSE); break;
+    case FB_RESTART: case FB_SHUTDOWN:
+        if (g_armId == id && now - g_armTime < 3500) {
+            ClosePopupNow();
+            ShellExecuteW(nullptr, L"open", L"shutdown.exe", id == FB_RESTART ? L"/r /t 0" : L"/s /t 0", nullptr, SW_HIDE);
+        } else { g_armId = id; g_armTime = now; }
+        break;
+    case FB_QUICK: ClosePopupNow(); SendKeys({VK_LWIN, 'A'}); break;
+    case FB_NOTIF: ClosePopupNow(); SendKeys({VK_LWIN, (WORD)(g_win11 ? 'N' : 'A')}); break;
+    case FB_CALPREV: if (--g_calM < 1) { g_calM = 12; g_calY--; } break;
+    case FB_CALNEXT: if (++g_calM > 12) { g_calM = 1; g_calY++; } break;
+    }
+    Kick();
+}
 static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    float x = GET_X_LPARAM(lp) / g_scale, y = GET_Y_LPARAM(lp) / g_scale - CardTop();
     switch (msg) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_NCHITTEST: return HTCLIENT;
     case WM_MOUSEMOVE: {
         if (!g_popTracking) { TRACKMOUSEEVENT t = {sizeof(t), TME_LEAVE, h, 0}; TrackMouseEvent(&t); g_popTracking = true; }
         KillTimer(g_hwnd, TMR_POPHIDE);
-        if (g_popA.t < 0.5f && g_popItem) { g_popA.t = 1; g_popY.t = 0; }
-        float x = GET_X_LPARAM(lp) / g_scale, y = GET_Y_LPARAM(lp) / g_scale;
-        int ht = -1; bool cl = false;
-        for (size_t i = 0; i < g_tiles.size(); i++) if (InR(g_tiles[i].r, x, y)) { ht = (int)i; cl = InR(TileClose(g_tiles[i]), x, y); }
-        if (ht != g_popHoverTile || cl != g_popHoverClose) {
-            g_popHoverTile = ht; g_popHoverClose = cl;
-            for (size_t i = 0; i < g_tiles.size(); i++) { g_tiles[i].hover.t = (int)i == ht ? 1.f : 0.f; g_tiles[i].closeH.t = ((int)i == ht && cl) ? 1.f : 0.f; }
+        if (g_popA.t < 0.5f && g_popMode == PM_PREVIEW && g_popItem) g_popA.t = 1;
+        if (g_popMode == PM_PREVIEW) {
+            int ht = -1; bool cl = false;
+            for (size_t i = 0; i < g_tiles.size(); i++) if (InR(g_tiles[i].r, x, y)) { ht = (int)i; cl = InR(TileClose(g_tiles[i]), x, y); }
+            if (ht != g_popHoverTile || cl != g_popHoverClose) {
+                g_popHoverTile = ht; g_popHoverClose = cl;
+                for (size_t i = 0; i < g_tiles.size(); i++) { g_tiles[i].hover.t = (int)i == ht ? 1.f : 0.f; g_tiles[i].closeH.t = ((int)i == ht && cl) ? 1.f : 0.f; }
+            }
+        } else {
+            if (g_volDrag) { SetVolumeAbs((x - 72.f) / std::max(1.f, (g_popW - 66.f) - 72.f)); Kick(); return 0; }
+            int hv = -1; for (size_t i = 0; i < g_fb.size(); i++) if (g_fb[i].seen && InR(g_fb[i].r, x, y)) hv = (int)i;
+            g_fbHover = hv; for (size_t i = 0; i < g_fb.size(); i++) g_fb[i].hv.t = (int)i == hv ? 1.f : 0.f;
         }
         Kick(); return 0;
     }
     case WM_MOUSELEAVE:
-        g_popTracking = false; g_popHoverTile = -1; g_popHoverClose = false;
+        g_popTracking = false; g_popHoverTile = -1; g_popHoverClose = false; g_fbHover = -1;
         for (auto& t : g_tiles) { t.hover.t = 0; t.closeH.t = 0; }
-        SetTimer(g_hwnd, TMR_POPHIDE, 280, nullptr); Kick(); return 0;
-    case WM_LBUTTONDOWN: g_popPressTile = g_popHoverTile; return 0;
+        for (auto& b : g_fb) b.hv.t = 0;
+        if (g_popMode == PM_PREVIEW) SetTimer(g_hwnd, TMR_POPHIDE, 280, nullptr);
+        Kick(); return 0;
+    case WM_LBUTTONDOWN:
+        g_popPressTile = g_popHoverTile; g_fbPress = g_fbHover;
+        if (g_popMode == PM_CONTROL && InR(g_volTrack, x, y)) { g_volDrag = true; SetCapture(h); SetVolumeAbs((x - 72.f) / std::max(1.f, (g_popW - 66.f) - 72.f)); Kick(); }
+        return 0;
     case WM_LBUTTONUP: {
-        int i = g_popHoverTile;
-        if (i >= 0 && i == g_popPressTile && i < (int)g_tiles.size()) {
-            HWND w = g_tiles[i].w;
-            if (g_popHoverClose) PostMessageW(w, WM_CLOSE, 0, 0); else { ActivateWin(w); ClosePopup(); }
-        } else if (g_tiles.empty() && g_popItem) { AppItem* it = g_popItem; ClosePopup(); ClickApp(it); }
-        g_popPressTile = -1; return 0;
+        if (g_volDrag) { g_volDrag = false; ReleaseCapture(); return 0; }
+        if (g_popMode == PM_PREVIEW) {
+            int i = g_popHoverTile;
+            if (i >= 0 && i == g_popPressTile && i < (int)g_tiles.size()) {
+                HWND w = g_tiles[i].w;
+                if (g_popHoverClose) PostMessageW(w, WM_CLOSE, 0, 0); else { ActivateWin(w); ClosePopup(); }
+            } else if (g_tiles.empty() && g_popItem) { AppItem* it = g_popItem; ClosePopup(); ClickApp(it); }
+            g_popPressTile = -1;
+        } else if (g_fbHover >= 0 && g_fbHover == g_fbPress && g_fbHover < (int)g_fb.size()) {
+            int id = g_fb[g_fbHover].id; if (id != FB_VOL) FlyAction(id);
+        }
+        g_fbPress = -1; return 0;
     }
-    case WM_MBUTTONUP: if (g_popHoverTile >= 0 && g_popHoverTile < (int)g_tiles.size()) PostMessageW(g_tiles[g_popHoverTile].w, WM_CLOSE, 0, 0); return 0;
+    case WM_MBUTTONUP: if (g_popMode == PM_PREVIEW && g_popHoverTile >= 0 && g_popHoverTile < (int)g_tiles.size()) PostMessageW(g_tiles[g_popHoverTile].w, WM_CLOSE, 0, 0); return 0;
+    case WM_MOUSEWHEEL: {
+        float n = GET_WHEEL_DELTA_WPARAM(wp) / (float)WHEEL_DELTA;
+        if (g_popMode == PM_CONTROL) SetVolumeAbs(g_vol + n * 0.02f);
+        else if (g_popMode == PM_TODAY) FlyAction(n > 0 ? FB_CALPREV : FB_CALNEXT);
+        Kick(); return 0;
+    }
+    case WM_CAPTURECHANGED: g_volDrag = false; return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
@@ -1906,6 +2521,7 @@ static void Frame() {
     bool more = UpdateAnims(dt);
     if (!CreateDevice()) { g_animating = false; return; }
     ID2D1DeviceContext* dc = g_dc;
+    if (g_brushDirty) { CreateBrushes(dc); g_brushDirty = false; }
     g_curDC = dc;
     dc->BeginDraw();
     DrawScene(dc, g_pxW / g_scale, g_pxH / g_scale, more);
@@ -1972,7 +2588,7 @@ static void DarkMenus() {
     auto setMode = (fnMode)GetProcAddress(ux, MAKEINTRESOURCEA(135)); auto flush = (fnFlush)GetProcAddress(ux, MAKEINTRESOURCEA(136));
     if (setMode) setMode(2 /*ForceDark*/); if (flush) flush();
 }
-enum { ID_TASKMGR = 100, ID_SETTINGS, ID_RELOAD, ID_TOGGLETB, ID_AUTOSTART, ID_TOP, ID_EXIT, ID_NEWWIN, ID_PIN, ID_CLOSE, ID_STATS, ID_TITLE, ID_CENTER, ID_MEDIA, ID_PREVIEWS, ID_TRASH, ID_STYLE, ID_EMPTYTRASH, ID_LANG };
+enum { ID_TASKMGR = 100, ID_SETTINGS, ID_RELOAD, ID_TOGGLETB, ID_AUTOSTART, ID_TOP, ID_EXIT, ID_NEWWIN, ID_PIN, ID_CLOSE, ID_STATS, ID_TITLE, ID_CENTER, ID_MEDIA, ID_PREVIEWS, ID_TRASH, ID_STYLE, ID_EMPTYTRASH, ID_LANG, ID_WEATHER, ID_AUTOACC, ID_FOCUS };
 static int ShowMenu(HMENU m) {
     POINT p; GetCursorPos(&p); SetForegroundWindow(g_hwnd);
     UINT fl = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | (g_cfg.top ? TPM_TOPALIGN : TPM_BOTTOMALIGN);
@@ -1994,6 +2610,9 @@ static void BarMenu() {
     AppendMenuW(m, MF_STRING | (g_cfg.trash ? MF_CHECKED : 0), ID_TRASH, L"Geri Dönüşüm Kutusu");
     AppendMenuW(m, MF_STRING | (g_cfg.lang ? MF_CHECKED : 0), ID_LANG, L"Klavye dili göstergesi");
     AppendMenuW(m, MF_STRING | (g_cfg.islands ? MF_CHECKED : 0), ID_STYLE, L"Ada görünümü");
+    AppendMenuW(m, MF_STRING | (g_cfg.weather ? MF_CHECKED : 0), ID_WEATHER, L"Hava durumu");
+    AppendMenuW(m, MF_STRING | (g_cfg.autoAccent ? MF_CHECKED : 0), ID_AUTOACC, L"Renkleri duvar kâğıdından al");
+    AppendMenuW(m, MF_STRING | (g_focusOn ? MF_CHECKED : 0), ID_FOCUS, g_focusOn ? L"Odak zamanlayıcısını durdur" : L"Odak zamanlayıcısını başlat");
     AppendMenuW(m, MF_STRING | (g_cfg.top ? MF_CHECKED : 0), ID_TOP, L"Ekranın üstüne al");
     AppendMenuW(m, MF_STRING | (g_cfg.hideTaskbar ? 0 : MF_CHECKED), ID_TOGGLETB, L"Windows görev çubuğunu da göster");
     AppendMenuW(m, MF_STRING | (AutoStartOn() ? MF_CHECKED : 0), ID_AUTOSTART, L"Windows ile başlat");
@@ -2013,6 +2632,9 @@ static void BarMenu() {
     case ID_PREVIEWS: SetIniBool(L"WindowPreviews", !g_cfg.previews); reload(); break;
     case ID_TRASH: SetIniBool(L"ShowTrash", !g_cfg.trash); reload(); break;
     case ID_LANG: SetIniBool(L"ShowKeyboardLayout", !g_cfg.lang); reload(); ReadLang(); break;
+    case ID_WEATHER: SetIniBool(L"ShowWeather", !g_cfg.weather); reload(); g_wxNext = 0; WeatherTick(true); break;
+    case ID_AUTOACC: SetIniBool(L"AutoAccent", !g_cfg.autoAccent); reload(); g_brushDirty = true; break;
+    case ID_FOCUS: if (g_focusOn) StopFocus(); else StartFocus(); break;
     case ID_STYLE: WritePrivateProfileStringW(L"Bar", L"Style", g_cfg.islands ? L"bar" : L"islands", g_iniPath.c_str()); reload(); break;
     case ID_TOP: WritePrivateProfileStringW(L"Bar", L"Position", g_cfg.top ? L"bottom" : L"top", g_iniPath.c_str()); reload(); break;
     case ID_TOGGLETB:
@@ -2064,6 +2686,8 @@ static Hit HitTest(float x, float y) {
     else if (InR(g_rQuick, x, y)) h.k = RK_QUICK;
     else if (InR(g_rClock, x, y)) h.k = RK_CLOCK;
     else if (g_langShow && InR(g_rLang, x, y)) h.k = RK_LANG;
+    else if (g_cfg.weather && g_wx.ok && InR(g_rWeather, x, y)) h.k = RK_WEATHER;
+    else if (g_focW.v > 20.f && InR(g_rFocus, x, y)) h.k = RK_FOCUS;
     else if (g_mW.v > 40.f && InR(g_rMPrev, x, y)) h.k = RK_MPREV;
     else if (g_mW.v > 40.f && InR(g_rMPlay, x, y)) h.k = RK_MPLAY;
     else if (g_mW.v > 40.f && InR(g_rMNext, x, y)) h.k = RK_MNEXT;
@@ -2078,6 +2702,7 @@ static void SetHover(const Hit& h) {
     bool p = g_press.k != RK_NONE && g_press == h;
     g_pStart.t = p && h.k == RK_START; g_pQuick.t = p && h.k == RK_QUICK; g_pClock.t = p && h.k == RK_CLOCK; g_pDesk.t = p && h.k == RK_DESK;
     g_hMInfo.t = h.k == RK_MINFO; g_hMPrev.t = h.k == RK_MPREV; g_hMPlay.t = h.k == RK_MPLAY; g_hMNext.t = h.k == RK_MNEXT; g_hLang.t = h.k == RK_LANG;
+    g_hFocus.t = h.k == RK_FOCUS; g_hWeather.t = h.k == RK_WEATHER; g_pWeather.t = p && h.k == RK_WEATHER;
     g_pMPrev.t = p && h.k == RK_MPREV; g_pMPlay.t = p && h.k == RK_MPLAY; g_pMNext.t = p && h.k == RK_MNEXT; g_pLang.t = p && h.k == RK_LANG;
     // window-preview popup: open after a short dwell, follow the cursor once open
     if (h.k == RK_APP && h.it && !g_dragItem) {
@@ -2091,12 +2716,17 @@ static void SetHover(const Hit& h) {
     Kick();
 }
 static void DoClick(const Hit& h) {
+    // clicks on the bar close an open Control Center / Today panel, except the ones that toggle it
+    bool toggles = h.k == RK_QUICK || h.k == RK_CLOCK || h.k == RK_WEATHER;
+    if (Sticky() && !toggles) ClosePopup();
     switch (h.k) {
     case RK_START: SendKeys({VK_LWIN}); break;
     case RK_APP: if (h.it) { ClosePopup(); ClickApp(h.it); } break;
     case RK_STATS: ShellExecuteW(nullptr, L"open", L"taskmgr.exe", nullptr, nullptr, SW_SHOWNORMAL); break;
-    case RK_QUICK: SendKeys({VK_LWIN, 'A'}); break;
-    case RK_CLOCK: SendKeys({VK_LWIN, (WORD)(g_win11 ? 'N' : 'A')}); break;
+    case RK_QUICK: if (Sticky() && g_popMode == PM_CONTROL && g_popA.t > 0.5f) ClosePopup(); else OpenFlyout(PM_CONTROL, (g_rQuick.left + g_rQuick.right) / 2); break;
+    case RK_CLOCK: if (Sticky() && g_popMode == PM_TODAY && g_popA.t > 0.5f) ClosePopup(); else OpenFlyout(PM_TODAY, (g_rClock.left + g_rClock.right) / 2); break;
+    case RK_WEATHER: if (Sticky() && g_popMode == PM_TODAY && g_popA.t > 0.5f) ClosePopup(); else OpenFlyout(PM_TODAY, (g_rWeather.left + g_rWeather.right) / 2); break;
+    case RK_FOCUS: if (g_focusOn) ToggleFocusPause(); else { g_focusDoneAt = 0; Kick(); } break;
     case RK_DESK: SendKeys({VK_LWIN, 'D'}); break;
     case RK_MPREV: MediaCmd(0); break;
     case RK_MPLAY: MediaCmd(1); break;
@@ -2105,6 +2735,12 @@ static void DoClick(const Hit& h) {
     case RK_LANG: SendKeys({VK_LWIN, VK_SPACE}); break;
     default: break;
     }
+}
+static void SetVolumeAbs(float v) {
+    if (!g_epv) AcquireVolume(); if (!g_epv) return;
+    v = Clamp01(v); g_epv->SetMasterVolumeLevelScalar(v, nullptr);
+    if (g_mute && v > 0.001f) { g_epv->SetMute(FALSE, nullptr); g_mute = false; }
+    g_vol = v; g_volV.t = v; Kick();
 }
 static void ChangeVolume(float delta) {
     if (!g_epv) AcquireVolume(); if (!g_epv) return;
@@ -2201,6 +2837,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ClosePopupNow();
         if (h.k == RK_APP && h.it) AppMenu(h.it);
         else if (h.k == RK_START) SendKeys({VK_LWIN, 'X'});
+        else if (h.k == RK_FOCUS) StopFocus();
+        else if (h.k == RK_QUICK) SendKeys({VK_LWIN, 'A'});
+        else if (h.k == RK_CLOCK) SendKeys({VK_LWIN, (WORD)(g_win11 ? 'N' : 'A')});
         else BarMenu();
         return 0;
     }
@@ -2221,6 +2860,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         else if (wp == TMR_POPHIDE) {
             KillTimer(hwnd, TMR_POPHIDE);
+            if (Sticky()) return 0;
             POINT pt; GetCursorPos(&pt); RECT pr = {};
             if (g_pop && g_popShown) GetWindowRect(g_pop, &pr);
             if (!(g_popShown && PtInRect(&pr, pt)) && !(g_hover.k == RK_APP && g_hover.it)) ClosePopup();
@@ -2228,7 +2868,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == TMR_REHIDE) { KillTimer(hwnd, TMR_REHIDE); g_abRegistered = false; if (g_cfg.hideTaskbar) HideWinTaskbar(); Reposition(); RefreshWindows(); }
         else if (wp == TMR_POLL) {
             g_tick++;
-            ReadClock(); ReadStats(); ReadVolume();
+            ReadClock(); ReadStats(); ReadVolume(); ReadNetSpeed(); FocusTick(); WeatherTick();
+            if (Sticky()) Kick();
             if (g_tick % 4 == 0) ReadNet();
             if (g_tick % 6 == 0) { if (!g_epv) AcquireVolume(); }
             if (g_tick % 3 == 0) RefreshWindows();
@@ -2237,6 +2878,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_cfg.hideTaskbar && g_tbHidden) { HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr); if (tb && IsWindowVisible(tb)) ForEachTaskbar(false); }
         }
         return 0;
+    case WM_WEATHER: {
+        WeatherData* d = (WeatherData*)lp; g_wxBusy = false;
+        if (d) {
+            if (d->ok) { g_wx = *d; g_wxNext = GetTickCount64() + 30ULL * 60000ULL; g_wxErr.clear(); }
+            else g_wxNext = GetTickCount64() + 5ULL * 60000ULL;
+            delete d;
+        }
+        if (Sticky() && g_popMode == PM_TODAY) { float a = (g_rClock.left + g_rClock.right) / 2; g_popH = TodayHeight(); PlacePopup(a, 8.f); }
+        Kick(); return 0;
+    }
+    case WM_CLOSEFLY: if (Sticky()) ClosePopup(); return 0;
     case WM_APPBAR:
         if (wp == ABN_POSCHANGED) Reposition();
         else if (wp == ABN_FULLSCREENAPP) {
@@ -2318,7 +2970,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     g_enter.snap(0); g_enter.t = 1;
     SetTimer(g_hwnd, TMR_POLL, 1000, nullptr);
     SetTimer(g_hwnd, TMR_FAST, 400, nullptr);
-    ReadLang(); if (g_cfg.trash) ReadTrash();
+    ReadLang(); if (g_cfg.trash) ReadTrash(); ReadNetSpeed(); WeatherTick(true);
     HWINEVENTHOOK hk[5];
     hk[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     hk[1] = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr, WinEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
