@@ -35,6 +35,7 @@
 #include <winhttp.h>
 #include <powrprof.h>
 #include <string>
+#include <cstdarg>
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -198,7 +199,7 @@ static UINT WM_TASKBARCREATED = 0;
 #define WM_REFRESH (WM_APP + 2)
 #define WM_WEATHER (WM_APP + 5)
 #define WM_CLOSEFLY (WM_APP + 6)
-enum { TMR_POLL = 1, TMR_REFRESH = 2, TMR_VOLHIDE = 3, TMR_REHIDE = 4, TMR_FAST = 5, TMR_POPUP = 6, TMR_POPHIDE = 7 };
+enum { TMR_POLL = 1, TMR_REFRESH = 2, TMR_VOLHIDE = 3, TMR_REHIDE = 4, TMR_FAST = 5, TMR_POPUP = 6, TMR_POPHIDE = 7, TMR_RETRY = 8 };
 
 static ID2D1Factory1* g_d2d = nullptr;
 static IDWriteFactory* g_dw = nullptr;
@@ -1172,16 +1173,60 @@ static void ClickApp(AppItem* it) {
 
 // ───────────────────────────── autostart ─────────────────────────────
 static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static bool AutoStartOn() {
+static const wchar_t* kApprovedKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+// A tiny log next to the exe, so a start-up problem can be seen afterwards (NovaBar.log, kept under 64 KB).
+static void Log(const wchar_t* fmt, ...) {
+    std::wstring path = g_exePath.substr(0, g_exePath.find_last_of(L'\\') + 1) + L"NovaBar.log";
+    WIN32_FILE_ATTRIBUTE_DATA fa = {};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeLow > 64 * 1024) DeleteFileW(path.c_str());
+    wchar_t msg[512]; va_list ap; va_start(ap, fmt); vswprintf(msg, 512, fmt, ap); va_end(ap);
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t line[640]; swprintf(line, 640, L"%04d-%02d-%02d %02d:%02d:%02d  %ls\r\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, msg);
+    int n = WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
+    std::string u(n > 0 ? n - 1 : 0, '\0'); if (n > 1) WideCharToMultiByte(CP_UTF8, 0, line, -1, &u[0], n, nullptr, nullptr);
+    HANDLE f = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(f, u.data(), (DWORD)u.size(), &w, nullptr); CloseHandle(f); }
+}
+static bool RunValueExists() {
     HKEY k; bool on = false;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_READ, &k) == ERROR_SUCCESS) { on = RegQueryValueExW(k, L"NovaBar", nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS; RegCloseKey(k); }
     return on;
 }
-static void SetAutoStart(bool on) {
-    HKEY k; if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_WRITE, &k) != ERROR_SUCCESS) return;
-    if (on) { std::wstring v = L"\"" + g_exePath + L"\""; RegSetValueExW(k, L"NovaBar", 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * 2)); }
-    else RegDeleteValueW(k, L"NovaBar");
+// Windows keeps its own on/off switch for start-up apps (Settings > Apps > Startup, Task Manager).
+// An odd first byte there means "turned off", and the Run entry is then skipped at sign-in.
+static bool StartupApprovedOff() {
+    HKEY k; BYTE b[12] = {}; DWORD sz = sizeof(b), type = 0; bool off = false;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kApprovedKey, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(k, L"NovaBar", nullptr, &type, b, &sz) == ERROR_SUCCESS && type == REG_BINARY && sz >= 1) off = (b[0] & 1) != 0;
+        RegCloseKey(k);
+    }
+    return off;
+}
+static bool AutoStartOn() { return RunValueExists() && !StartupApprovedOff(); }
+static void WriteRunValue() {
+    HKEY k; if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    std::wstring v = L"\"" + g_exePath + L"\" --autostart";
+    RegSetValueExW(k, L"NovaBar", 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * 2));
     RegCloseKey(k);
+}
+static void SetAutoStart(bool on) {
+    if (on) {
+        WriteRunValue();
+        // mark it as enabled for Windows' start-up manager
+        HKEY k;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, kApprovedKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) == ERROR_SUCCESS) {
+            BYTE b[12] = {2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            RegSetValueExW(k, L"NovaBar", 0, REG_BINARY, b, sizeof(b)); RegCloseKey(k);
+        }
+        // a downloaded exe carries an "from the internet" mark that can block it at sign-in: remove it (same as Properties > Unblock)
+        DeleteFileW((g_exePath + L":Zone.Identifier").c_str());
+        Log(L"autostart on: %ls", g_exePath.c_str());
+    } else {
+        HKEY k;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_WRITE, &k) == ERROR_SUCCESS) { RegDeleteValueW(k, L"NovaBar"); RegCloseKey(k); }
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kApprovedKey, 0, KEY_WRITE, &k) == ERROR_SUCCESS) { RegDeleteValueW(k, L"NovaBar"); RegCloseKey(k); }
+        Log(L"autostart off");
+    }
 }
 
 // ───────────────────────────── graphics device ─────────────────────────────
@@ -1241,6 +1286,7 @@ static bool CreateDevice() {
     if (g_dc) return true;
     D3D_FEATURE_LEVEL fl[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_9_3};
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, fl, 5, D3D11_SDK_VERSION, &g_d3d, nullptr, nullptr);
+    if (FAILED(hr)) { Log(L"hardware D3D device failed (0x%08lx), trying WARP", (unsigned long)hr); }
     if (FAILED(hr)) hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, fl, 5, D3D11_SDK_VERSION, &g_d3d, nullptr, nullptr);
     if (FAILED(hr)) return false;
     IDXGIDevice* dxdev = nullptr; g_d3d->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxdev);
@@ -1260,7 +1306,7 @@ static bool CreateDevice() {
     if (SUCCEEDED(hr)) hr = g_dtarget->SetRoot(g_visual);
     if (SUCCEEDED(hr)) hr = g_dcomp->Commit();
     SafeRelease(fac); SafeRelease(ad); SafeRelease(dxdev);
-    if (FAILED(hr) || !CreateTargetBitmap()) { DiscardDevice(); return false; }
+    if (FAILED(hr) || !CreateTargetBitmap()) { static int logged = 0; if (logged++ < 5) Log(L"graphics device creation failed (0x%08lx), will retry", (unsigned long)hr); DiscardDevice(); return false; }
     g_dc->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     CreateBrushes(g_dc);
     return true;
@@ -2519,7 +2565,7 @@ static void Frame() {
     float dt = (float)(now.QuadPart - g_last.QuadPart) / (float)g_qpf.QuadPart; g_last = now;
     if (dt > 0.05f) dt = 0.05f; if (dt < 0) dt = 0;
     bool more = UpdateAnims(dt);
-    if (!CreateDevice()) { g_animating = false; return; }
+    if (!CreateDevice()) { g_animating = false; SetTimer(g_hwnd, TMR_RETRY, 1000, nullptr); return; }
     ID2D1DeviceContext* dc = g_dc;
     if (g_brushDirty) { CreateBrushes(dc); g_brushDirty = false; }
     g_curDC = dc;
@@ -2854,6 +2900,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == TMR_REFRESH) { KillTimer(hwnd, TMR_REFRESH); RefreshWindows(); }
         else if (wp == TMR_VOLHIDE) { KillTimer(hwnd, TMR_VOLHIDE); g_volShow.t = 0; Kick(); }
         else if (wp == TMR_FAST) { MediaPoll(); ReadLang(); }
+        else if (wp == TMR_RETRY) { KillTimer(hwnd, TMR_RETRY); Kick(); }
         else if (wp == TMR_POPUP) {
             KillTimer(hwnd, TMR_POPUP);
             if (g_hover.k == RK_APP && g_hover.it && g_hover.it == g_hoverPend && !g_dragItem && g_press.k == RK_NONE) OpenPopup(g_hoverPend);
@@ -2931,9 +2978,23 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     if (!g_dw || !g_wic) return 1;
     LoadConfig(); CreateTextResources();
 
-
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"NovaBar.SingleInstance.Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    bool autostart = a1 == L"--autostart";
+    Log(L"start%ls (%ls)", autostart ? L" at sign-in" : L"", g_exePath.c_str());
+    // keep the start-up entry pointing at this exe, even after it was moved
+    if (RunValueExists()) WriteRunValue();
+    if (autostart) {
+        // at sign-in, wait for the Windows shell and the desktop compositor before building the bar
+        ULONGLONG t0 = GetTickCount64(); BOOL comp = FALSE;
+        while (GetTickCount64() - t0 < 120000) {
+            comp = FALSE; DwmIsCompositionEnabled(&comp);
+            if (FindWindowW(L"Shell_TrayWnd", nullptr) && comp) break;
+            Sleep(500);
+        }
+        Sleep(1500);
+        Log(L"shell ready after %llu ms", (unsigned long long)(GetTickCount64() - t0));
+    }
     SetUnhandledExceptionFilter(CrashFilter);
     DarkMenus();
     typedef LONG(WINAPI * fnRtl)(PRTL_OSVERSIONINFOW);
