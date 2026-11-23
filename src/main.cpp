@@ -250,8 +250,9 @@ struct TrayIcon {
     HICON icon = nullptr; std::wstring tip; bool hidden = false; DWORD pid = 0; unsigned long long order = 0;
     IWICBitmap* wic = nullptr; ID2D1Bitmap* bmp = nullptr; int bmpGen = -1;
     Spring hv, appear; D2D1_RECT_F r = {};
+    std::wstring exe; bool sysDup = false; // exe = owner process file name (lower case)
 };
-static std::vector<TrayIcon*> g_tray; static HWND g_trayWnd = nullptr; static unsigned long long g_trayOrder = 0;
+static std::vector<TrayIcon*> g_tray; static std::vector<std::wstring> g_trayHide; static HWND g_trayWnd = nullptr; static unsigned long long g_trayOrder = 0;
 static ULONGLONG g_ignoreTbCreatedUntil = 0;
 static HWND ExplorerTray() { // explorer's taskbar, never NovaBar's own tray host window
     HWND h = nullptr;
@@ -1338,8 +1339,32 @@ struct TrayMsg { DWORD sig; DWORD msg; NID32 nid; };
 struct TrayIconIdent { DWORD magic; DWORD msg; DWORD cbSize; DWORD pad; DWORD hWnd; UINT uID; GUID guid; };
 #pragma pack(pop)
 
+static std::wstring TrayKey(const TrayIcon* t) {
+    if (t->hasGuid) { wchar_t g[64]; StringFromGUID2(t->guid, g, 64); return t->exe + L"|" + g; }
+    return t->exe + L"|" + std::to_wstring(t->uid);
+}
+static bool TrayUserHidden(const TrayIcon* t) { std::wstring k = TrayKey(t); return std::find(g_trayHide.begin(), g_trayHide.end(), k) != g_trayHide.end(); }
+static void LoadTrayHide() {
+    g_trayHide.clear(); int n = IniInt(L"TrayHidden", L"Count", 0);
+    for (int i = 0; i < n && i < 200; i++) { std::wstring v = IniGet(L"TrayHidden", std::to_wstring(i).c_str(), L""); if (!v.empty()) g_trayHide.push_back(v); }
+}
+static void SaveTrayHide() {
+    WritePrivateProfileStringW(L"TrayHidden", nullptr, nullptr, g_iniPath.c_str());
+    WritePrivateProfileStringW(L"TrayHidden", L"Count", std::to_wstring(g_trayHide.size()).c_str(), g_iniPath.c_str());
+    for (size_t i = 0; i < g_trayHide.size(); i++) WritePrivateProfileStringW(L"TrayHidden", std::to_wstring(i).c_str(), g_trayHide[i].c_str(), g_iniPath.c_str());
+}
+static void TrayHideIcon(TrayIcon* t) { if (!t) return; std::wstring k = TrayKey(t); if (!TrayUserHidden(t)) { g_trayHide.push_back(k); SaveTrayHide(); } Kick(); }
+// Windows' own volume / network / power icons duplicate NovaBar's built-in ones (and don't answer forwarded clicks).
+static bool IsSystemDuplicate(const TrayIcon* t) {
+    if (t->exe != L"explorer.exe") return false;
+    std::wstring tip = Lower(t->tip);
+    static const wchar_t* words[] = {L"hoparl", L"kulakl", L"ses", L"sessiz", L"speaker", L"headphone", L"volume", L"mute", L"audio",
+                                     L"ağ", L"internet", L"network", L"wi-fi", L"wifi", L"ethernet", L"pil", L"battery", L"güç", L"power"};
+    for (auto* w : words) if (tip.find(w) != std::wstring::npos) return true;
+    return tip.find(L'%') != std::wstring::npos;
+}
 static std::vector<TrayIcon*> TrayVisible() {
-    std::vector<TrayIcon*> v; for (auto* t : g_tray) if (!t->hidden && t->icon) v.push_back(t);
+    std::vector<TrayIcon*> v; for (auto* t : g_tray) if (!t->hidden && t->icon && !t->sysDup && !TrayUserHidden(t)) v.push_back(t);
     std::sort(v.begin(), v.end(), [](TrayIcon* a, TrayIcon* b) { return a->order < b->order; });
     return v;
 }
@@ -1354,6 +1379,7 @@ static void TrayApply(TrayIcon* t, const NID32& n) {
         if (c || !n.hIcon) { if (t->icon) DestroyIcon(t->icon); t->icon = c; SafeRelease(t->bmp); SafeRelease(t->wic); t->wic = c ? WicFromHICON(c) : nullptr; t->bmpGen = -1; }
     }
     if (n.uFlags & NIF_TIP) { size_t l = 0; while (l < 128 && n.szTip[l]) l++; t->tip.assign(n.szTip, l); }
+    t->sysDup = IsSystemDuplicate(t);
     if (n.uFlags & NIF_STATE) { if (n.dwStateMask & NIS_HIDDEN) t->hidden = (n.dwState & NIS_HIDDEN) != 0; }
     if (n.uFlags & NIF_GUID) { t->guid = n.guidItem; t->hasGuid = true; }
 }
@@ -1374,6 +1400,7 @@ static LRESULT TrayNotify(const void* data, DWORD cb) {
         if (t) return FALSE;
         t = new TrayIcon(); t->hwnd = hw; t->uid = n.uID; t->order = ++g_trayOrder;
         GetWindowThreadProcessId(hw, &t->pid);
+        { std::wstring ex = Lower(ProcPath(t->pid)); size_t s0 = ex.find_last_of(L'\\'); t->exe = s0 == std::wstring::npos ? ex : ex.substr(s0 + 1); }
         TrayApply(t, n); t->appear.v = 0; t->appear.t = 1;
         g_tray.push_back(t); Kick(); return TRUE;
     }
@@ -2704,7 +2731,7 @@ static void DrawTray(ID2D1RenderTarget* rt) {
         if (b.hv.v > 0.5f) tip = v[i]->tip;
     }
     if (v.empty()) Txt(rt, L"Arka planda simgesi olan uygulama yok.", g_fTile, RF(16, 40, W - 16, 60), Col(1, 1, 1, 0.5f));
-    if (tip.empty()) tip = L"Tıkla: aç  ·  Sağ tık: menü";
+    if (tip.empty()) tip = L"Tıkla: aç  ·  Sağ tık: menü  ·  Orta tık: gizle";
     for (auto& c : tip) if (c == L'\n' || c == L'\r') c = L' ';
     Txt(rt, tip, g_fTile, RF(12, g_popH - 28, W - 12, g_popH - 10), Col(1, 1, 1, 0.6f));
 }
@@ -2872,7 +2899,12 @@ static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (i < (int)v.size()) { TrayIcon* t = v[i]; ClosePopupNow(); TrayClick(t, 1); }
         }
         return 0;
-    case WM_MBUTTONUP: if (g_popMode == PM_PREVIEW && g_popHoverTile >= 0 && g_popHoverTile < (int)g_tiles.size()) PostMessageW(g_tiles[g_popHoverTile].w, WM_CLOSE, 0, 0); return 0;
+    case WM_MBUTTONUP:
+        if (g_popMode == PM_TRAY && g_fbHover >= 0 && g_fbHover < (int)g_fb.size() && g_fb[g_fbHover].id >= 1000) {
+            auto v = TrayVisible(); int i = g_fb[g_fbHover].id - 1000; if (i < (int)v.size()) TrayHideIcon(v[i]);
+            return 0;
+        }
+        if (g_popMode == PM_PREVIEW && g_popHoverTile >= 0 && g_popHoverTile < (int)g_tiles.size()) PostMessageW(g_tiles[g_popHoverTile].w, WM_CLOSE, 0, 0); return 0;
     case WM_MOUSEWHEEL: {
         float n = GET_WHEEL_DELTA_WPARAM(wp) / (float)WHEEL_DELTA;
         if (g_popMode == PM_CONTROL) SetVolumeAbs(g_vol + n * 0.02f);
@@ -2959,7 +2991,7 @@ static void DarkMenus() {
     auto setMode = (fnMode)GetProcAddress(ux, MAKEINTRESOURCEA(135)); auto flush = (fnFlush)GetProcAddress(ux, MAKEINTRESOURCEA(136));
     if (setMode) setMode(2 /*ForceDark*/); if (flush) flush();
 }
-enum { ID_TASKMGR = 100, ID_SETTINGS, ID_RELOAD, ID_TOGGLETB, ID_AUTOSTART, ID_TOP, ID_EXIT, ID_NEWWIN, ID_PIN, ID_CLOSE, ID_STATS, ID_TITLE, ID_CENTER, ID_MEDIA, ID_PREVIEWS, ID_TRASH, ID_STYLE, ID_EMPTYTRASH, ID_LANG, ID_WEATHER, ID_AUTOACC, ID_FOCUS, ID_TRAY };
+enum { ID_TASKMGR = 100, ID_SETTINGS, ID_RELOAD, ID_TOGGLETB, ID_AUTOSTART, ID_TOP, ID_EXIT, ID_NEWWIN, ID_PIN, ID_CLOSE, ID_STATS, ID_TITLE, ID_CENTER, ID_MEDIA, ID_PREVIEWS, ID_TRASH, ID_STYLE, ID_EMPTYTRASH, ID_LANG, ID_WEATHER, ID_AUTOACC, ID_FOCUS, ID_TRAY, ID_TRAYRESET };
 static int ShowMenu(HMENU m) {
     POINT p; GetCursorPos(&p); SetForegroundWindow(g_hwnd);
     UINT fl = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | (g_cfg.top ? TPM_TOPALIGN : TPM_BOTTOMALIGN);
@@ -2983,6 +3015,7 @@ static void BarMenu() {
     AppendMenuW(m, MF_STRING | (g_cfg.islands ? MF_CHECKED : 0), ID_STYLE, L"Ada görünümü");
     AppendMenuW(m, MF_STRING | (g_cfg.weather ? MF_CHECKED : 0), ID_WEATHER, L"Hava durumu");
     AppendMenuW(m, MF_STRING | (g_cfg.tray ? MF_CHECKED : 0), ID_TRAY, L"Sistem tepsisi simgeleri");
+    if (!g_trayHide.empty()) AppendMenuW(m, MF_STRING, ID_TRAYRESET, (L"Gizlenen tepsi simgelerini geri getir (" + std::to_wstring(g_trayHide.size()) + L")").c_str());
     AppendMenuW(m, MF_STRING | (g_cfg.autoAccent ? MF_CHECKED : 0), ID_AUTOACC, L"Renkleri duvar kâğıdından al");
     AppendMenuW(m, MF_STRING | (g_focusOn ? MF_CHECKED : 0), ID_FOCUS, g_focusOn ? L"Odak zamanlayıcısını durdur" : L"Odak zamanlayıcısını başlat");
     AppendMenuW(m, MF_STRING | (g_cfg.top ? MF_CHECKED : 0), ID_TOP, L"Ekranın üstüne al");
@@ -3004,6 +3037,7 @@ static void BarMenu() {
     case ID_PREVIEWS: SetIniBool(L"WindowPreviews", !g_cfg.previews); reload(); break;
     case ID_TRASH: SetIniBool(L"ShowTrash", !g_cfg.trash); reload(); break;
     case ID_LANG: SetIniBool(L"ShowKeyboardLayout", !g_cfg.lang); reload(); ReadLang(); break;
+    case ID_TRAYRESET: g_trayHide.clear(); SaveTrayHide(); Kick(); break;
     case ID_TRAY: SetIniBool(L"ShowTray", !g_cfg.tray); reload(); if (g_cfg.tray) CreateTrayHost(); else DestroyTrayHost(); break;
     case ID_WEATHER: SetIniBool(L"ShowWeather", !g_cfg.weather); reload(); g_wxNext = 0; WeatherTick(true); break;
     case ID_AUTOACC: SetIniBool(L"AutoAccent", !g_cfg.autoAccent); reload(); g_brushDirty = true; break;
@@ -3226,7 +3260,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (any) { SavePins(); g_winCache.clear(); RefreshWindows(); for (auto* it : g_items) if (it->pinned && it->appear.v < 0.01f) it->bounce = 0; Kick(); }
         return 0;
     }
-    case WM_MBUTTONUP: { Hit h = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale); if (h.k == RK_APP && h.it) { h.it->ripple = 0; if (h.it->wins.empty()) h.it->bounce = 0; Launch(h.it); Kick(); } return 0; }
+    case WM_MBUTTONUP: { Hit h = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale); if (h.k == RK_TRAY && h.ti) { ClosePopupNow(); TrayHideIcon(h.ti); g_hover = Hit(); return 0; } if (h.k == RK_APP && h.it) { h.it->ripple = 0; if (h.it->wins.empty()) h.it->bounce = 0; Launch(h.it); Kick(); } return 0; }
     case WM_RBUTTONDOWN: DismissShellFlyout(); return 0;
     case WM_RBUTTONUP: {
         Hit h = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale);
@@ -3386,7 +3420,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     SetTimer(g_hwnd, TMR_POLL, 1000, nullptr);
     SetTimer(g_hwnd, TMR_FAST, 400, nullptr);
     ReadLang(); if (g_cfg.trash) ReadTrash(); ReadNetSpeed(); WeatherTick(true);
-    CreateTrayHost();
+    LoadTrayHide(); CreateTrayHost();
     HWINEVENTHOOK hk[5];
     hk[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     hk[1] = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr, WinEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);

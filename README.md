@@ -17,7 +17,7 @@ Tek dosya · ~540 KB · kurulum yok · Direct2D + DirectComposition</p>
 - **Canlı pencere önizlemeleri** — İkonun üzerinde bekle: açık pencerelerin canlı küçük görüntüleri; tıkla geç, × ile kapat.
 - **Kontrol Merkezi** — Ses adasına tıkla: sürüklenebilir ses kaydırıcısı, anlık ağ hızı, karanlık mod anahtarı, odak zamanlayıcısı, ekran alıntısı / pano / emoji kısayolları, Wi-Fi, Bluetooth, Ayarlar ve kilitle · uyku · yeniden başlat · kapat (yeniden başlat ve kapat ikinci tıklamada onay ister).
 - **Bugün paneli** — Saate tıkla: büyük saat, hava durumu ve 6 saatlik tahmin, gezinilebilir aylık takvim.
-- **Sistem tepsisi** — Arka plandaki uygulamaların (sohbet, bulut, antivirüs…) küçük simgeleri sağ adada; ilk birkaçı doğrudan görünür, ok düğmesi hepsini ızgara hâlinde açar. Sol tık, sağ tık menüsü, çift tık ve ipucu metinleri uygulamaya iletilir. Windows'un kendi tepsisi de güncel kalır.
+- **Sistem tepsisi** — Arka plandaki uygulamaların (sohbet, bulut, antivirüs…) küçük simgeleri sağ adada; ilk birkaçı doğrudan görünür, ok düğmesi hepsini ızgara hâlinde açar. Sol tık, sağ tık menüsü, çift tık ve ipucu metinleri uygulamaya iletilir; orta tık simgeyi gizler. Windows'un ses, ağ ve pil simgeleri NovaBar'da zaten olduğu için gösterilmez. Windows'un kendi tepsisi de güncel kalır.
 - **Hava durumu** — Sağ adada sıcaklık ve durum ikonu ([open-meteo.com](https://open-meteo.com), anahtar gerektirmez). Şehir: `WeatherCity` ayarı.
 - **Odak zamanlayıcısı** — Sol adada geri sayan halka; tıkla duraklat, sağ tıkla iptal.
 - **Duvar kâğıdından renk** — Vurgu renkleri duvar kâğıdına göre kendiliğinden seçilir.
