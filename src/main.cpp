@@ -101,7 +101,7 @@ struct Config {
 } g_cfg;
 struct Pin { std::wstring key, target; };
 static std::vector<Pin> g_pins;
-static std::wstring g_iniPath, g_exePath;
+static std::wstring g_iniPath, g_exePath, g_dataDir; static bool g_packaged = false;
 
 static std::wstring Lower(std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; }
 static std::wstring IniGet(const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
@@ -1205,7 +1205,7 @@ static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\
 static const wchar_t* kApprovedKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 // A tiny log next to the exe, so a start-up problem can be seen afterwards (NovaBar.log, kept under 64 KB).
 static void Log(const wchar_t* fmt, ...) {
-    std::wstring path = g_exePath.substr(0, g_exePath.find_last_of(L'\\') + 1) + L"NovaBar.log";
+    std::wstring path = g_dataDir + L"NovaBar.log";
     WIN32_FILE_ATTRIBUTE_DATA fa = {};
     if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeLow > 64 * 1024) DeleteFileW(path.c_str());
     wchar_t msg[512]; va_list ap; va_start(ap, fmt); vswprintf(msg, 512, fmt, ap); va_end(ap);
@@ -1231,7 +1231,37 @@ static bool StartupApprovedOff() {
     }
     return off;
 }
-static bool AutoStartOn() { return RunValueExists() && !StartupApprovedOff(); }
+// ── Store (MSIX) builds start through the package's StartupTask instead of the Run key / Task Scheduler.
+struct NbStartupTask : public IInspectable {
+    virtual HRESULT STDMETHODCALLTYPE RequestEnableAsync(NbAsyncOp**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Disable() = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_State(int*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_TaskId(HSTRING*) = 0;
+};
+struct NbStartupTaskStatics : public IInspectable {
+    virtual HRESULT STDMETHODCALLTYPE GetForCurrentPackageAsync(NbAsyncOp**) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAsync(HSTRING, NbAsyncOp**) = 0;
+};
+static const GUID kIID_StartupStatics = {0xee5b60bd, 0xa148, 0x41a7, {0xb2, 0x6e, 0xe8, 0xb8, 0x8a, 0x1e, 0x62, 0xf8}};
+static bool WaitOp(NbAsyncOp* op, DWORD ms) { // small, bounded wait for a WinRT async call
+    ULONGLONG t0 = GetTickCount64(); int s;
+    while ((s = OpStatus(op)) == 0 && GetTickCount64() - t0 < ms) Sleep(10);
+    return s == 1;
+}
+static NbStartupTask* PkgStartupTask() {
+    HSTRING cls = nullptr, id = nullptr; NbStartupTaskStatics* st = nullptr; NbAsyncOp* op = nullptr; NbStartupTask* t = nullptr;
+    const wchar_t* cn = L"Windows.ApplicationModel.StartupTask"; const wchar_t* tid = L"NovaBarStartup";
+    if (SUCCEEDED(WindowsCreateString(cn, (UINT32)wcslen(cn), &cls)) && SUCCEEDED(RoGetActivationFactory(cls, kIID_StartupStatics, (void**)&st)) && st &&
+        SUCCEEDED(WindowsCreateString(tid, (UINT32)wcslen(tid), &id)) && SUCCEEDED(st->GetAsync(id, &op)) && op && WaitOp(op, 3000))
+        op->GetResults((void*)&t);
+    SafeRelease(op); SafeRelease(st); if (id) WindowsDeleteString(id); if (cls) WindowsDeleteString(cls);
+    return t;
+}
+static int PkgStartupState() { int s = 0; if (NbStartupTask* t = PkgStartupTask()) { t->get_State(&s); t->Release(); } return s; }
+static bool AutoStartOn() {
+    if (g_packaged) { int s = PkgStartupState(); return s == 2 || s == 4; }
+    return RunValueExists() && !StartupApprovedOff();
+}
 static void WriteRunValue() {
     HKEY k; if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
     std::wstring v = L"\"" + g_exePath + L"\" --autostart";
@@ -1240,6 +1270,18 @@ static void WriteRunValue() {
 }
 static void SyncLogonTask(bool on);
 static void SetAutoStart(bool on) {
+    if (g_packaged) {
+        NbStartupTask* t = PkgStartupTask(); if (!t) { Log(L"startup task unavailable"); return; }
+        if (on) {
+            NbAsyncOp* op = nullptr; int st = 0;
+            if (SUCCEEDED(t->RequestEnableAsync(&op)) && op && WaitOp(op, 5000)) op->GetResults((void*)&st);
+            SafeRelease(op);
+            Log(L"startup task enable -> state %d", st);
+            // turned off by the user in Settings: Windows only lets the user turn it back on there
+            if (st == 1) ShellExecuteW(nullptr, L"open", L"ms-settings:startupapps", nullptr, nullptr, SW_SHOWNORMAL);
+        } else { t->Disable(); Log(L"startup task disabled"); }
+        t->Release(); return;
+    }
     if (on) {
         WriteRunValue();
         // mark it as enabled for Windows' start-up manager
@@ -2820,7 +2862,7 @@ static void FlyAction(int id) {
     ULONGLONG now = GetTickCount64();
     switch (id) {
     case FB_MUTE: if (g_epv) { g_mute = !g_mute; g_epv->SetMute(g_mute, nullptr); } break;
-    case FB_DARK: g_dark = !g_dark; SetDarkMode(g_dark); break;
+    case FB_DARK: if (g_packaged) { ClosePopup(); ShellExecuteW(nullptr, L"open", L"ms-settings:colors", nullptr, nullptr, SW_SHOWNORMAL); } else { g_dark = !g_dark; SetDarkMode(g_dark); } break;
     case FB_FOCUS: if (g_focusOn) StopFocus(); else StartFocus(); break;
     case FB_SNIP: ClosePopupNow(); SendKeys({VK_LWIN, VK_SHIFT, 'S'}); break;
     case FB_CLIP: ClosePopupNow(); SendKeys({VK_LWIN, 'V'}); break;
@@ -3336,7 +3378,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSCOLORCHANGE: BuildWallpaper(); Kick(); return 0;
     case WM_PAINT: { ValidateRect(hwnd, nullptr); Kick(); return 0; }
     case WM_QUERYENDSESSION: return TRUE;
-    case WM_ENDSESSION: if (wp) { if (g_tbHidden) RestoreWinTaskbar(); DestroyTrayHost(); } return 0;
+    case WM_ENDSESSION:
+        if (wp) { if (g_tbHidden) RestoreWinTaskbar(); DestroyTrayHost(); if (lp & ENDSESSION_CLOSEAPP) DestroyWindow(hwnd); } // app update/uninstall closes us
+        return 0;
     case WM_DESTROY: {
         KillTimer(hwnd, TMR_POLL);
         APPBARDATA abd = {sizeof(abd)}; abd.hWnd = hwnd; SHAppBarMessage(ABM_REMOVE, &abd);
@@ -3351,7 +3395,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // ───────────────────────────── entry ─────────────────────────────
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     wchar_t ep[MAX_PATH * 2]; GetModuleFileNameW(nullptr, ep, MAX_PATH * 2); g_exePath = ep;
-    g_iniPath = g_exePath.substr(0, g_exePath.find_last_of(L'\\') + 1) + L"NovaBar.ini";
+    {   // where settings and the log live: the package's LocalState for Store builds, next to the exe otherwise
+        typedef LONG(WINAPI * fnPFN)(UINT32*, PWSTR);
+        auto pfn = (fnPFN)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetCurrentPackageFamilyName");
+        wchar_t fam[256] = {}; UINT32 fl = 256;
+        g_packaged = pfn && pfn(&fl, fam) == ERROR_SUCCESS && fam[0];
+        std::wstring exeDir = g_exePath.substr(0, g_exePath.find_last_of(L'\\') + 1);
+        wchar_t la[MAX_PATH] = {}; GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH);
+        if (g_packaged) g_dataDir = std::wstring(la) + L"\\Packages\\" + fam + L"\\LocalState\\";
+        else {
+            std::wstring probe = exeDir + L"NovaBar.write-test";
+            HANDLE f = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+            if (f != INVALID_HANDLE_VALUE) { CloseHandle(f); g_dataDir = exeDir; }
+            else g_dataDir = std::wstring(la) + L"\\NovaBar\\";
+        }
+        CreateDirectoryW(g_dataDir.c_str(), nullptr);
+        g_iniPath = g_dataDir + L"NovaBar.ini";
+    }
     int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     std::wstring a1 = argc > 1 ? Lower(argv[1]) : L"";
     if (a1 == L"--restore") { LoadConfig(); RestoreWinTaskbar(); return 0; }
@@ -3371,7 +3431,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     bool autostart = a1 == L"--autostart";
     Log(L"start%ls (%ls)", autostart ? L" at sign-in" : L"", g_exePath.c_str());
     // keep the start-up entry pointing at this exe, even after it was moved
-    if (RunValueExists()) { WriteRunValue(); if (!autostart) SyncLogonTask(true); }
+    if (!g_packaged && RunValueExists()) { WriteRunValue(); if (!autostart) SyncLogonTask(true); }
     if (autostart) {
         // at sign-in, wait for the Windows shell and the desktop compositor before building the bar
         ULONGLONG t0 = GetTickCount64(); BOOL comp = FALSE;

@@ -45,6 +45,16 @@ Ayarlar exe'nin yanındaki `NovaBar.ini` dosyasında (sağ tık → *Ayar dosyas
 - Windows: [MSYS2](https://www.msys2.org/) MinGW64 kabuğunda `build.bat`
 - Linux: `sudo apt install mingw-w64` ve `./build.sh`
 
+## Microsoft Store paketi
+
+`store/` klasörü Store için gerekenleri içerir: paket bildirimi (`AppxManifest.template.xml`), logolar, ekran görüntüleri, mağaza metinleri (`LISTING.md`) ve paketleyici. Partner Center'daki *Ürün kimliği* değerlerini `store/identity.ini` dosyasına yazıp şunu çalıştır:
+
+```
+./build.sh && python3 store/make_msix.py      # dist/NovaBar.msix (imzasız; Store imzalar)
+```
+
+Store sürümü ayarlarını uygulamanın kendi klasöründe (`%LOCALAPPDATA%\Packages\…\LocalState`) tutar ve Windows ile başlatmak için paketin başlangıç görevini kullanır. Gizlilik politikası: [PRIVACY.md](PRIVACY.md).
+
 ## Bilinen sınırlar
 
 - Yalnızca ana monitör.
