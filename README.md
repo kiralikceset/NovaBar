@@ -55,6 +55,14 @@ Ayarlar exe'nin yanındaki `NovaBar.ini` dosyasında (sağ tık → *Ayar dosyas
 
 Store sürümü ayarlarını uygulamanın kendi klasöründe (`%LOCALAPPDATA%\Packages\…\LocalState`) tutar ve Windows ile başlatmak için paketin başlangıç görevini kullanır. Gizlilik politikası: [PRIVACY.md](PRIVACY.md).
 
+## Kendini toparlama
+
+- **Bekçi süreci:** `NovaBar.exe` önce küçük bir bekçi olarak açılır ve asıl barı `NovaBar.exe --child` olarak başlatır. Bu yüzden Görev Yöneticisi'nde iki NovaBar görürsün. Bar çökerse ya da ~25 sn donarsa bekçi önce Windows görev çubuğunu geri getirir, sonra barı yeniden açar. Bar 3 dakikada 5 kez çökerse bekçi pes eder ve ekranda Windows görev çubuğu kalır.
+- **Tam ekran algılama:** Windows'un "tam ekran uygulama" bildirimi yerine bar ön plandaki pencereyi kendisi kontrol eder. Tam ekran bir pencere varken gizlenir, o pencere kapanınca geri gelir.
+- **Gözetim:** Bar 2 saniyede bir yerinde ve görünür olup olmadığını kontrol eder. Uykudan uyanınca grafik ve konum baştan kurulur.
+- **Günlük:** Ne olduysa `NovaBar.log` dosyasına yazılır (`CRASH`, `self-heal`, `guardian` satırları).
+- Bekçi olmadan çalıştırmak için: `NovaBar.exe --noguard`
+
 ## Bilinen sınırlar
 
 - Yalnızca ana monitör.

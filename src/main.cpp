@@ -41,6 +41,7 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <exception>
 
 // ───────────────────────────── helpers ─────────────────────────────
 template <class T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
@@ -205,6 +206,7 @@ static UINT WM_TASKBARCREATED = 0;
 #define WM_WEATHER (WM_APP + 5)
 #define WM_CLOSEFLY (WM_APP + 6)
 enum { TMR_POLL = 1, TMR_REFRESH = 2, TMR_VOLHIDE = 3, TMR_REHIDE = 4, TMR_FAST = 5, TMR_POPUP = 6, TMR_POPHIDE = 7, TMR_RETRY = 8 };
+static void Log(const wchar_t* fmt, ...);
 
 static ID2D1Factory1* g_d2d = nullptr;
 static IDWriteFactory* g_dw = nullptr;
@@ -1167,7 +1169,23 @@ static void RestoreWinTaskbar() {
     WritePrivateProfileStringW(L"State", L"OriginalTaskbarState", nullptr, g_iniPath.c_str());
     g_tbHidden = false;
 }
-static LONG WINAPI CrashFilter(EXCEPTION_POINTERS*) { if (g_tbHidden) RestoreWinTaskbar(); return EXCEPTION_CONTINUE_SEARCH; }
+// If the bar dies, write down where (NovaBar.log) and hand the Windows taskbar back at once;
+// the guardian process then starts a fresh bar.
+static LONG WINAPI CrashFilter(EXCEPTION_POINTERS* ep) {
+    static LONG once = 0;
+    if (InterlockedExchange(&once, 1) == 0) {
+        if (ep && ep->ExceptionRecord)
+            Log(L"CRASH code=0x%08X at NovaBar.exe+0x%llX", (unsigned)ep->ExceptionRecord->ExceptionCode,
+                (unsigned long long)((BYTE*)ep->ExceptionRecord->ExceptionAddress - (BYTE*)GetModuleHandleW(nullptr)));
+        if (g_tbHidden) RestoreWinTaskbar();
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void OnTerminate() {
+    Log(L"CRASH std::terminate (uncaught C++ exception)");
+    if (g_tbHidden) RestoreWinTaskbar();
+    TerminateProcess(GetCurrentProcess(), 0xE0000BAD);
+}
 
 // ───────────────────────────── input helpers ─────────────────────────────
 static void SendKeys(std::initializer_list<WORD> keys) {
@@ -2958,6 +2976,59 @@ static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(h, msg, wp, lp);
 }
 
+// ───────────────────────────── fullscreen detection / self-heal ─────────────────────────────
+// Windows' ABN_FULLSCREENAPP notice alone is unreliable: the "fullscreen app closed" notice often
+// never arrives, which used to leave the bar hidden for good. We look for ourselves instead.
+static bool IsShellOrOwn(HWND h) {
+    wchar_t c[64] = {}; GetClassNameW(h, c, 64);
+    static const wchar_t* k[] = {L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd", L"NovaBarWnd", L"NovaBarPreview",
+                                 L"Windows.UI.Core.CoreWindow", L"XamlExplorerHostIslandWindow", L"TopLevelWindowForOverflowXamlIsland",
+                                 L"NotifyIconOverflowWindow", L"ForegroundStaging", L"MultitaskingViewFrame", L"LockScreenControllerProxyWindow"};
+    for (auto* x : k) if (!wcscmp(c, x)) return true;
+    return false;
+}
+static bool DetectFullscreen() {
+    HWND fg = GetForegroundWindow(); if (!fg) return false;
+    fg = GetAncestor(fg, GA_ROOT);
+    if (!fg || !IsWindowVisible(fg) || IsIconic(fg) || IsShellOrOwn(fg)) return false;
+    DWORD pid = 0; GetWindowThreadProcessId(fg, &pid); if (pid == GetCurrentProcessId()) return false;
+    BOOL cloaked = FALSE; DwmGetWindowAttribute(fg, 14 /*DWMWA_CLOAKED*/, &cloaked, sizeof(cloaked)); if (cloaked) return false;
+    HMONITOR mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONULL);
+    MONITORINFO mi = {sizeof(mi)}; if (!mon || !GetMonitorInfoW(mon, &mi)) return false;
+    if (!EqualRect(&mi.rcMonitor, &g_monRc)) return false;   // fullscreen on another screen: not our business
+    RECT r; if (FAILED(DwmGetWindowAttribute(fg, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)))) GetWindowRect(fg, &r);
+    const RECT& m = mi.rcMonitor;
+    return r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom;
+}
+static void ClosePopupNow();
+static void SetFullscreen(bool fs) {
+    if (fs == g_fullscreen) return;
+    g_fullscreen = fs;
+    if (fs) { ShowWindow(g_hwnd, SW_HIDE); ClosePopupNow(); }
+    else { SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW); Kick(); }
+}
+static void CheckFullscreen() { SetFullscreen(DetectFullscreen()); }
+static void Reposition();
+static bool g_inRepos = false;
+// Every couple of seconds: if nothing fullscreen is in front, the bar must be on screen, in place and on top.
+static void SelfHeal(unsigned tick) {
+    CheckFullscreen();
+    if (g_fullscreen || g_inRepos) return;
+    RECT r = {}; GetWindowRect(g_hwnd, &r);
+    bool shown = IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd);
+    static int streak = 0;   // stop after a few tries if Windows keeps it elsewhere on purpose
+    if (!shown || !EqualRect(&r, &g_winRc)) {
+        if (++streak <= 3 || !shown) {
+            Log(L"self-heal: bar was %ls, putting it back", shown ? L"out of place" : L"hidden");
+            Reposition(); ShowWindow(g_hwnd, SW_SHOWNA); Kick();
+        }
+    } else streak = 0;
+    if (tick % 10 == 0) {
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        Kick();   // one frame now and then, so a lost graphics device is noticed and rebuilt
+    }
+}
+
 static void Frame() {
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     float dt = (float)(now.QuadPart - g_last.QuadPart) / (float)g_qpf.QuadPart; g_last = now;
@@ -2981,7 +3052,7 @@ static void Frame() {
 }
 
 // ───────────────────────────── positioning / appbar ─────────────────────────────
-static bool g_abRegistered = false, g_inRepos = false;
+static bool g_abRegistered = false;
 static void Reposition() {
     if (g_inRepos) return;
     struct Guard { Guard() { g_inRepos = true; } ~Guard() { g_inRepos = false; } } guard;
@@ -3216,7 +3287,7 @@ static void ChangeVolume(float delta) {
 // ───────────────────────────── win events ─────────────────────────────
 static void CALLBACK WinEvent(HWINEVENTHOOK, DWORD ev, HWND h, LONG obj, LONG child, DWORD, DWORD) {
     if (obj != OBJID_WINDOW || child != CHILDID_SELF || !h) return;
-    if (ev == EVENT_SYSTEM_FOREGROUND || ev == EVENT_SYSTEM_MINIMIZEEND) { UpdateActive(); if (ev == EVENT_SYSTEM_FOREGROUND) ReadLang(); Kick(); return; }
+    if (ev == EVENT_SYSTEM_FOREGROUND || ev == EVENT_SYSTEM_MINIMIZEEND) { UpdateActive(); if (ev == EVENT_SYSTEM_FOREGROUND) ReadLang(); CheckFullscreen(); Kick(); return; }
     if (ev == EVENT_OBJECT_NAMECHANGE) { if (h == g_fg) UpdateActive(); return; }
     if (ev == EVENT_OBJECT_SHOW && g_cfg.hideTaskbar && g_tbHidden) {
         wchar_t cls[32]; GetClassNameW(h, cls, 32);
@@ -3326,7 +3397,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == TMR_REFRESH) { KillTimer(hwnd, TMR_REFRESH); RefreshWindows(); }
         else if (wp == TMR_VOLHIDE) { KillTimer(hwnd, TMR_VOLHIDE); g_volShow.t = 0; Kick(); }
-        else if (wp == TMR_FAST) { MediaPoll(); ReadLang(); }
+        else if (wp == TMR_FAST) { MediaPoll(); ReadLang(); CheckFullscreen(); }
         else if (wp == TMR_RETRY) { KillTimer(hwnd, TMR_RETRY); Kick(); }
         else if (wp == TMR_POPUP) {
             KillTimer(hwnd, TMR_POPUP);
@@ -3343,6 +3414,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == TMR_REHIDE) { KillTimer(hwnd, TMR_REHIDE); g_abRegistered = false; if (g_cfg.hideTaskbar) HideWinTaskbar(); Reposition(); RefreshWindows(); if (g_trayWnd) { TrayKeepOnTop(false); TrayBroadcast(); } }
         else if (wp == TMR_POLL) {
             g_tick++;
+            if (g_tick % 2 == 0) SelfHeal(g_tick);
             ReadClock(); ReadStats(); ReadVolume(); ReadNetSpeed(); FocusTick(); WeatherTick();
             if (Sticky()) Kick();
             if (g_tick % 4 == 0) ReadNet();
@@ -3368,12 +3440,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APPBAR:
         if (wp == ABN_POSCHANGED) Reposition();
         else if (wp == ABN_FULLSCREENAPP) {
-            g_fullscreen = lp != 0;
-            if (lp) { ShowWindow(hwnd, SW_HIDE); ClosePopupNow(); }
-            else { SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW); Kick(); }
+            (void)lp; CheckFullscreen();   // only a hint: we check the screen ourselves
         }
         return 0;
-    case WM_DISPLAYCHANGE: case WM_DPICHANGED: Reposition(); return 0;
+    case WM_DISPLAYCHANGE: case WM_DPICHANGED: Reposition(); Kick(); return 0;
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
+            Log(L"woke from sleep: rebuilding graphics and position");
+            ClosePopupNow(); DiscardDevice(); SetTimer(hwnd, TMR_REHIDE, 1500, nullptr); Kick();
+        }
+        return TRUE;
     case WM_SETTINGCHANGE: if (wp == SPI_SETWORKAREA) return 0; if (wp == SPI_SETDESKWALLPAPER || wp == 0) { BuildWallpaper(); Kick(); } ReadClock(); return 0;
     case WM_SYSCOLORCHANGE: BuildWallpaper(); Kick(); return 0;
     case WM_PAINT: { ValidateRect(hwnd, nullptr); Kick(); return 0; }
@@ -3390,6 +3466,66 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ───────────────────────────── guardian ─────────────────────────────
+// NovaBar.exe started normally becomes a tiny watcher that runs the real bar as "NovaBar.exe --child".
+// If the bar crashes or stops responding, the watcher gives the Windows taskbar back and starts a new bar.
+// Quitting from the bar's menu (exit code 0) ends both.
+static volatile bool g_guardEnding = false;
+static LRESULT CALLBACK GuardProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_QUERYENDSESSION) { g_guardEnding = true; return TRUE; }
+    if (m == WM_ENDSESSION) { g_guardEnding = w != 0; return 0; }
+    return DefWindowProcW(h, m, w, l);
+}
+static HWND FindBarOf(DWORD pid) {
+    HWND h = nullptr;
+    while ((h = FindWindowExW(nullptr, h, L"NovaBarWnd", nullptr))) { DWORD p = 0; GetWindowThreadProcessId(h, &p); if (p == pid) return h; }
+    return nullptr;
+}
+static int RunGuardian(HINSTANCE hi, bool autostart) {
+    HANDLE gm = CreateMutexW(nullptr, TRUE, L"NovaBar.Guardian.Mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { if (gm) CloseHandle(gm); return 0; }
+    WNDCLASSEXW wc = {sizeof(wc)}; wc.lpfnWndProc = GuardProc; wc.hInstance = hi; wc.lpszClassName = L"NovaBarGuardian";
+    RegisterClassExW(&wc);
+    CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"NovaBar Guardian", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, hi, nullptr);   // never shown; hears sign-out
+    std::vector<ULONGLONG> fails;
+    bool first = true;
+    for (;;) {
+        std::wstring cl = L"\"" + g_exePath + L"\" --child" + (autostart && first ? L" --autostart" : L"");
+        first = false;
+        STARTUPINFOW si = {sizeof(si)}; PROCESS_INFORMATION pi = {};
+        if (!CreateProcessW(g_exePath.c_str(), &cl[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            Log(L"guardian: could not start the bar (error %lu)", GetLastError()); break;
+        }
+        CloseHandle(pi.hThread);
+        int hung = 0; bool killed = false;
+        for (;;) {
+            DWORD r = MsgWaitForMultipleObjects(1, &pi.hProcess, FALSE, 1000, QS_ALLINPUT);
+            if (r == WAIT_OBJECT_0) break;
+            MSG m; while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); }
+            if (r == WAIT_TIMEOUT && !g_guardEnding) {
+                HWND bar = FindBarOf(pi.dwProcessId);
+                hung = bar && IsHungAppWindow(bar) ? hung + 1 : 0;
+                if (hung >= 20) {   // IsHungAppWindow already needs ~5 s of silence, so ~25 s frozen in total
+                    Log(L"guardian: bar froze, restarting it");
+                    TerminateProcess(pi.hProcess, 0xDEAD); WaitForSingleObject(pi.hProcess, 5000); killed = true; break;
+                }
+            }
+        }
+        DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hProcess);
+        if (code == 0 && !killed) break;                                   // "Quit" from the menu
+        if (g_guardEnding || GetSystemMetrics(SM_SHUTTINGDOWN)) break;     // signing out / shutting down
+        LoadConfig(); RestoreWinTaskbar();                                 // never leave the user without a taskbar
+        ULONGLONG now = GetTickCount64();
+        fails.push_back(now);
+        while (!fails.empty() && now - fails.front() > 180000) fails.erase(fails.begin());
+        Log(L"guardian: bar stopped (code 0x%08X), restart %u", (unsigned)code, (unsigned)fails.size());
+        if (fails.size() >= 5) { Log(L"guardian: 5 failures in 3 minutes, giving up; Windows taskbar is back"); break; }
+        Sleep((DWORD)fails.size() * 1000);
+    }
+    if (gm) { ReleaseMutex(gm); CloseHandle(gm); }
+    return 0;
 }
 
 // ───────────────────────────── entry ─────────────────────────────
@@ -3413,9 +3549,11 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
         g_iniPath = g_dataDir + L"NovaBar.ini";
     }
     int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    std::wstring a1 = argc > 1 ? Lower(argv[1]) : L"";
-    if (a1 == L"--restore") { LoadConfig(); RestoreWinTaskbar(); return 0; }
+    auto hasArg = [&](const wchar_t* a) { for (int i = 1; i < argc; i++) if (!_wcsicmp(argv[i], a)) return true; return false; };
+    if (hasArg(L"--restore")) { LoadConfig(); RestoreWinTaskbar(); return 0; }
+    bool autostart = hasArg(L"--autostart");
     (void)cmd;
+    if (!hasArg(L"--child") && !hasArg(L"--noguard")) return RunGuardian(hi, autostart);
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     QueryPerformanceFrequency(&g_qpf);
@@ -3428,7 +3566,6 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
 
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"NovaBar.SingleInstance.Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
-    bool autostart = a1 == L"--autostart";
     Log(L"start%ls (%ls)", autostart ? L" at sign-in" : L"", g_exePath.c_str());
     // keep the start-up entry pointing at this exe, even after it was moved
     if (!g_packaged && RunValueExists()) { WriteRunValue(); if (!autostart) SyncLogonTask(true); }
@@ -3444,6 +3581,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
         Log(L"shell ready after %llu ms", (unsigned long long)(GetTickCount64() - t0));
     }
     SetUnhandledExceptionFilter(CrashFilter);
+    std::set_terminate(OnTerminate);
     DarkMenus();
     typedef LONG(WINAPI * fnRtl)(PRTL_OSVERSIONINFOW);
     if (auto rtl = (fnRtl)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")) { RTL_OSVERSIONINFOW v = {sizeof(v)}; rtl(&v); g_win11 = v.dwBuildNumber >= 22000; }
