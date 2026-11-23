@@ -1,10 +1,11 @@
 <p align="center"><img src="docs/logo.png" width="96" alt="NovaBar logo"></p>
 <h1 align="center">NovaBar</h1>
 <p align="center">Windows 10/11 için hafif, animasyonlu, premium görev çubuğu ve dock.<br>
-Tek dosya · ~500 KB · kurulum yok · Direct2D + DirectComposition</p>
+Tek dosya · ~540 KB · kurulum yok · Direct2D + DirectComposition</p>
 
 <p align="center"><img src="docs/preview-features.png" alt="NovaBar önizleme"></p>
 <p align="center"><img src="docs/preview-panels.png" alt="Kontrol Merkezi ve Bugün paneli"></p>
+<p align="center"><img src="docs/preview-tray.png" alt="Sistem tepsisi"></p>
 
 > Görseller tasarım önizlemesidir; gerçek görünüm duvar kâğıdına ve uygulamalarına göre değişir.
 
@@ -16,6 +17,7 @@ Tek dosya · ~500 KB · kurulum yok · Direct2D + DirectComposition</p>
 - **Canlı pencere önizlemeleri** — İkonun üzerinde bekle: açık pencerelerin canlı küçük görüntüleri; tıkla geç, × ile kapat.
 - **Kontrol Merkezi** — Ses adasına tıkla: sürüklenebilir ses kaydırıcısı, anlık ağ hızı, karanlık mod anahtarı, odak zamanlayıcısı, ekran alıntısı / pano / emoji kısayolları, Wi-Fi, Bluetooth, Ayarlar ve kilitle · uyku · yeniden başlat · kapat (yeniden başlat ve kapat ikinci tıklamada onay ister).
 - **Bugün paneli** — Saate tıkla: büyük saat, hava durumu ve 6 saatlik tahmin, gezinilebilir aylık takvim.
+- **Sistem tepsisi** — Arka plandaki uygulamaların (sohbet, bulut, antivirüs…) küçük simgeleri sağ adada; ilk birkaçı doğrudan görünür, ok düğmesi hepsini ızgara hâlinde açar. Sol tık, sağ tık menüsü, çift tık ve ipucu metinleri uygulamaya iletilir. Windows'un kendi tepsisi de güncel kalır.
 - **Hava durumu** — Sağ adada sıcaklık ve durum ikonu ([open-meteo.com](https://open-meteo.com), anahtar gerektirmez). Şehir: `WeatherCity` ayarı.
 - **Odak zamanlayıcısı** — Sol adada geri sayan halka; tıkla duraklat, sağ tıkla iptal.
 - **Duvar kâğıdından renk** — Vurgu renkleri duvar kâğıdına göre kendiliğinden seçilir.
@@ -45,8 +47,8 @@ Ayarlar exe'nin yanındaki `NovaBar.ini` dosyasında (sağ tık → *Ayar dosyas
 
 ## Bilinen sınırlar
 
-- Sistem tepsisi ikonları gösterilmez (sağ tık menüsünden Windows görev çubuğu geri açılabilir).
 - Yalnızca ana monitör.
+- Sistem tepsisi, uygulamaların tepsi mesajlarını NovaBar'a yönlendirerek çalışır; bir uygulamada sorun görürsen sağ tık → *Sistem tepsisi simgeleri* ile kapatabilirsin (Windows tepsisi etkilenmez).
 
 ## Lisans
 

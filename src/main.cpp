@@ -97,7 +97,7 @@ struct Config {
     uint32_t accent = 0x7AA2FF, accent2 = 0xB983FF;
     bool center = true, stats = true, title = true, hideTaskbar = true, islands = true;
     bool media = true, previews = true, trash = true, lang = true;
-    bool weather = true, autoAccent = true; int focusMin = 25; std::wstring city = L"Istanbul";
+    bool weather = true, autoAccent = true, tray = true; int focusMin = 25, trayInline = 3; std::wstring city = L"Istanbul";
 } g_cfg;
 struct Pin { std::wstring key, target; };
 static std::vector<Pin> g_pins;
@@ -146,6 +146,9 @@ static void WriteDefaultIni() {
         L"; 1 = vurgu renklerini duvar kâğıdından al (Accent/Accent2 yok sayılır)\r\n"
         L"AutoAccent=1\r\n"
         L"FocusMinutes=25\r\n"
+        L"; Sistem tepsisi simgeleri ve sağ adada doğrudan gösterilecek simge sayısı\r\n"
+        L"ShowTray=1\r\n"
+        L"TrayInline=3\r\n"
         L"\r\n[Pins]\r\nCount=1\r\n0=c:\\windows\\explorer.exe|explorer.exe\r\n";
     HANDLE f = CreateFileW(g_iniPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
@@ -173,6 +176,8 @@ static void LoadConfig() {
     g_cfg.weather = IniInt(L"Bar", L"ShowWeather", 1) != 0;
     g_cfg.city = IniGet(L"Bar", L"WeatherCity", L"Istanbul"); if (g_cfg.city.empty()) g_cfg.city = L"Istanbul";
     g_cfg.autoAccent = IniInt(L"Bar", L"AutoAccent", 1) != 0;
+    g_cfg.tray = IniInt(L"Bar", L"ShowTray", 1) != 0;
+    g_cfg.trayInline = std::max(0, std::min(8, IniInt(L"Bar", L"TrayInline", 3)));
     g_cfg.focusMin = std::max(1, std::min(180, IniInt(L"Bar", L"FocusMinutes", 25)));
     g_pins.clear();
     int n = IniInt(L"Pins", L"Count", 0);
@@ -238,8 +243,22 @@ struct AppItem {
 };
 static std::vector<AppItem*> g_items;
 
-enum RK { RK_NONE, RK_START, RK_APP, RK_STATS, RK_QUICK, RK_CLOCK, RK_DESK, RK_MINFO, RK_MPREV, RK_MPLAY, RK_MNEXT, RK_LANG, RK_FOCUS, RK_WEATHER };
-struct Hit { RK k = RK_NONE; AppItem* it = nullptr; bool operator==(const Hit& o) const { return k == o.k && it == o.it; } };
+enum RK { RK_NONE, RK_START, RK_APP, RK_STATS, RK_QUICK, RK_CLOCK, RK_DESK, RK_MINFO, RK_MPREV, RK_MPLAY, RK_MNEXT, RK_LANG, RK_FOCUS, RK_WEATHER, RK_TRAY, RK_TRAYMORE };
+// system-tray icons hosted by NovaBar (see "system tray host" below)
+struct TrayIcon {
+    HWND hwnd = nullptr; UINT uid = 0; GUID guid = {}; bool hasGuid = false; UINT cb = 0; UINT ver = 0;
+    HICON icon = nullptr; std::wstring tip; bool hidden = false; DWORD pid = 0; unsigned long long order = 0;
+    IWICBitmap* wic = nullptr; ID2D1Bitmap* bmp = nullptr; int bmpGen = -1;
+    Spring hv, appear; D2D1_RECT_F r = {};
+};
+static std::vector<TrayIcon*> g_tray; static HWND g_trayWnd = nullptr; static unsigned long long g_trayOrder = 0;
+static ULONGLONG g_ignoreTbCreatedUntil = 0;
+static HWND ExplorerTray() { // explorer's taskbar, never NovaBar's own tray host window
+    HWND h = nullptr;
+    while ((h = FindWindowExW(nullptr, h, L"Shell_TrayWnd", nullptr))) if (h != g_trayWnd) return h;
+    return nullptr;
+}
+struct Hit { RK k = RK_NONE; AppItem* it = nullptr; TrayIcon* ti = nullptr; bool operator==(const Hit& o) const { return k == o.k && it == o.it && ti == o.ti; } };
 static Hit g_hover, g_press;
 static Spring g_hStart, g_pStart, g_hStats, g_hQuick, g_pQuick, g_hClock, g_pClock, g_hDesk, g_pDesk;
 static Spring g_indX, g_indW, g_indA, g_enter, g_mouseX, g_barHover, g_volShow, g_volV, g_cpuV, g_ramV, g_batV;
@@ -252,7 +271,8 @@ static ID2D1StrokeStyle* g_round = nullptr;
 static RECT g_winRc = {}, g_monRc = {};
 static float g_md = 8.f;
 static Spring g_divW;
-static D2D1_RECT_F g_islL, g_islC, g_islR;
+static D2D1_RECT_F g_islL, g_islC, g_islR, g_rTrayMore = {};
+static TrayIcon* g_hoverTray = nullptr; static Spring g_hTrayMore, g_pTrayMore; static bool g_suppressUp = false;
 // media / extras / drag / popup shared state
 static Spring g_mW, g_mA, g_mPlayT, g_hMInfo, g_hMPrev, g_hMPlay, g_hMNext, g_pMPrev, g_pMPlay, g_pMNext, g_hLang, g_pLang;
 static float g_mProg = 0;
@@ -378,13 +398,20 @@ static IWICBitmap* WicFromShell(const std::wstring& path, int size) {
     if (FAILED(hr) || !hb) return nullptr;
     IWICBitmap* r = WicFromHBITMAP(hb); DeleteObject(hb); return r;
 }
+static IWICBitmap* WicFromHICON(HICON hi) {
+    if (!hi) return nullptr;
+    IWICBitmap* src = nullptr; IWICFormatConverter* cv = nullptr; IWICBitmap* out = nullptr;
+    if (SUCCEEDED(g_wic->CreateBitmapFromHICON(hi, &src)) && src && SUCCEEDED(g_wic->CreateFormatConverter(&cv)) && cv &&
+        SUCCEEDED(cv->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)))
+        g_wic->CreateBitmapFromSource(cv, WICBitmapCacheOnLoad, &out);
+    SafeRelease(cv); SafeRelease(src); return out;
+}
 static IWICBitmap* WicFromWindow(HWND h) {
     HICON hi = nullptr;
     DWORD_PTR res = 0;
     if (SendMessageTimeoutW(h, WM_GETICON, ICON_BIG, 0, SMTO_ABORTIFHUNG, 60, &res) && res) hi = (HICON)res;
     if (!hi) hi = (HICON)GetClassLongPtrW(h, GCLP_HICON);
-    if (!hi) return nullptr;
-    IWICBitmap* wb = nullptr; g_wic->CreateBitmapFromHICON(hi, &wb); return wb;
+    return WicFromHICON(hi);
 }
 static uint32_t ToneFromWic(IWICBitmap* b) {
     UINT w = 0, h = 0; if (FAILED(b->GetSize(&w, &h)) || !w || !h || w * h > 512 * 512) return 0;
@@ -1113,11 +1140,11 @@ static bool PinPath(const std::wstring& path) {
 
 // ───────────────────────────── Windows taskbar hide / restore ─────────────────────────────
 static void ForEachTaskbar(bool show) {
-    HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr); if (tb) ShowWindow(tb, show ? SW_SHOWNA : SW_HIDE);
+    HWND tb = ExplorerTray(); if (tb) ShowWindow(tb, show ? SW_SHOWNA : SW_HIDE);
     HWND s = nullptr; while ((s = FindWindowExW(nullptr, s, L"Shell_SecondaryTrayWnd", nullptr))) ShowWindow(s, show ? SW_SHOWNA : SW_HIDE);
 }
 static void HideWinTaskbar() {
-    HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr); if (!tb) return;
+    HWND tb = ExplorerTray(); if (!tb) return;
     APPBARDATA a = {sizeof(a)}; a.hWnd = tb;
     std::wstring saved = IniGet(L"State", L"OriginalTaskbarState", L"");
     if (saved.empty()) {
@@ -1129,7 +1156,7 @@ static void HideWinTaskbar() {
 }
 static void RestoreWinTaskbar() {
     std::wstring saved = IniGet(L"State", L"OriginalTaskbarState", L"");
-    HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr);
+    HWND tb = ExplorerTray();
     if (tb) {
         APPBARDATA a = {sizeof(a)}; a.hWnd = tb;
         a.lParam = saved.empty() ? ABS_ALWAYSONTOP : (LPARAM)_wtoi(saved.c_str());
@@ -1297,6 +1324,155 @@ static bool ShellFlyoutOpen() {
 static bool g_shellFlyoutWasOpen = false;
 static void DismissShellFlyout() { g_shellFlyoutWasOpen = ShellFlyoutOpen(); if (g_shellFlyoutWasOpen) SendKeys({VK_ESCAPE}); }
 
+// ───────────────────────────── system tray host ─────────────────────────────
+// Apps add tray icons by sending WM_COPYDATA to the first window of class "Shell_TrayWnd".
+// NovaBar registers such a window, keeps it above explorer's in z-order, shows the icons itself
+// and forwards every message to explorer's tray too, so the Windows taskbar stays in sync.
+#pragma pack(push, 4)
+struct NID32 {
+    DWORD cbSize, hWnd, uID, uFlags, uCallbackMessage, hIcon;
+    WCHAR szTip[128]; DWORD dwState, dwStateMask; WCHAR szInfo[256]; UINT uVersion; WCHAR szInfoTitle[64];
+    DWORD dwInfoFlags; GUID guidItem; DWORD hBalloonIcon;
+};
+struct TrayMsg { DWORD sig; DWORD msg; NID32 nid; };
+struct TrayIconIdent { DWORD magic; DWORD msg; DWORD cbSize; DWORD pad; DWORD hWnd; UINT uID; GUID guid; };
+#pragma pack(pop)
+
+static std::vector<TrayIcon*> TrayVisible() {
+    std::vector<TrayIcon*> v; for (auto* t : g_tray) if (!t->hidden && t->icon) v.push_back(t);
+    std::sort(v.begin(), v.end(), [](TrayIcon* a, TrayIcon* b) { return a->order < b->order; });
+    return v;
+}
+static void TrayFree(TrayIcon* t) {
+    if (g_hover.ti == t) g_hover = Hit(); if (g_press.ti == t) g_press = Hit(); if (g_hoverTray == t) g_hoverTray = nullptr;
+    SafeRelease(t->bmp); SafeRelease(t->wic); if (t->icon) DestroyIcon(t->icon); delete t;
+}
+static void TrayApply(TrayIcon* t, const NID32& n) {
+    if (n.uFlags & NIF_MESSAGE) t->cb = n.uCallbackMessage;
+    if (n.uFlags & NIF_ICON) {
+        HICON c = n.hIcon ? CopyIcon((HICON)(UINT_PTR)n.hIcon) : nullptr;
+        if (c || !n.hIcon) { if (t->icon) DestroyIcon(t->icon); t->icon = c; SafeRelease(t->bmp); SafeRelease(t->wic); t->wic = c ? WicFromHICON(c) : nullptr; t->bmpGen = -1; }
+    }
+    if (n.uFlags & NIF_TIP) { size_t l = 0; while (l < 128 && n.szTip[l]) l++; t->tip.assign(n.szTip, l); }
+    if (n.uFlags & NIF_STATE) { if (n.dwStateMask & NIS_HIDDEN) t->hidden = (n.dwState & NIS_HIDDEN) != 0; }
+    if (n.uFlags & NIF_GUID) { t->guid = n.guidItem; t->hasGuid = true; }
+}
+static TrayIcon* TrayFind(HWND hw, UINT uid, const GUID* g) {
+    for (auto* t : g_tray) {
+        if (g) { if (t->hasGuid && IsEqualGUID(t->guid, *g)) return t; }
+        else if (t->hwnd == hw && t->uid == uid) return t;
+    }
+    return nullptr;
+}
+static LRESULT TrayNotify(const void* data, DWORD cb) {
+    TrayMsg m; ZeroMemory(&m, sizeof(m)); memcpy(&m, data, std::min<size_t>(cb, sizeof(m)));
+    const NID32& n = m.nid;
+    HWND hw = (HWND)(UINT_PTR)n.hWnd;
+    TrayIcon* t = TrayFind(hw, n.uID, (n.uFlags & NIF_GUID) ? &n.guidItem : nullptr);
+    switch (m.msg) {
+    case NIM_ADD: {
+        if (t) return FALSE;
+        t = new TrayIcon(); t->hwnd = hw; t->uid = n.uID; t->order = ++g_trayOrder;
+        GetWindowThreadProcessId(hw, &t->pid);
+        TrayApply(t, n); t->appear.v = 0; t->appear.t = 1;
+        g_tray.push_back(t); Kick(); return TRUE;
+    }
+    case NIM_MODIFY: if (!t) return FALSE; TrayApply(t, n); Kick(); return TRUE;
+    case NIM_DELETE: {
+        if (!t) return FALSE;
+        g_tray.erase(std::remove(g_tray.begin(), g_tray.end(), t), g_tray.end()); TrayFree(t); Kick(); return TRUE;
+    }
+    case NIM_SETVERSION: if (!t) return FALSE; t->ver = n.uVersion; return TRUE;
+    case NIM_SETFOCUS: return TRUE;
+    }
+    return FALSE;
+}
+static RECT TrayIconScreenRect(TrayIcon* t) {
+    const float S = g_scale; D2D1_RECT_F r = (t->r.right > t->r.left) ? t->r : g_rTrayMore;
+    return RECT{g_winRc.left + (LONG)((g_md + r.left) * S), g_winRc.top + (LONG)((g_md + r.top) * S), g_winRc.left + (LONG)((g_md + r.right) * S), g_winRc.top + (LONG)((g_md + r.bottom) * S)};
+}
+static LRESULT CALLBACK TrayProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_COPYDATA) {
+        COPYDATASTRUCT* cds = (COPYDATASTRUCT*)lp; if (!cds) return FALSE;
+        HWND ex = ExplorerTray(); DWORD_PTR res = 0;
+        if (cds->dwData == 1 && cds->lpData && cds->cbData >= 8 + 24) {
+            LRESULT r = TrayNotify(cds->lpData, cds->cbData);
+            if (ex) SendMessageTimeoutW(ex, WM_COPYDATA, wp, lp, SMTO_ABORTIFHUNG, 500, &res);
+            return r;
+        }
+        if (cds->dwData == 3 && cds->lpData && cds->cbData >= sizeof(TrayIconIdent)) { // Shell_NotifyIconGetRect
+            const TrayIconIdent* id = (const TrayIconIdent*)cds->lpData;
+            GUID zero = {}; bool byGuid = !IsEqualGUID(id->guid, zero);
+            TrayIcon* t = TrayFind((HWND)(UINT_PTR)id->hWnd, id->uID, byGuid ? &id->guid : nullptr);
+            if (t) { RECT r = TrayIconScreenRect(t); return id->msg == 1 ? MAKELONG(r.left, r.top) : MAKELONG(r.right, r.bottom); }
+        }
+        if (ex && SendMessageTimeoutW(ex, WM_COPYDATA, wp, lp, SMTO_ABORTIFHUNG, 3000, &res)) return (LRESULT)res;
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static void TrayBroadcast() {
+    if (!WM_TASKBARCREATED) return;
+    g_ignoreTbCreatedUntil = GetTickCount64() + 4000;
+    SendNotifyMessageW(HWND_BROADCAST, WM_TASKBARCREATED, 0, 0); // apps re-add their icons to the first Shell_TrayWnd
+}
+static void TrayKeepOnTop(bool rebroadcastIfDisplaced) {
+    if (!g_trayWnd) return;
+    if (FindWindowW(L"Shell_TrayWnd", nullptr) != g_trayWnd) {
+        SetWindowPos(g_trayWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        static ULONGLONG last = 0; ULONGLONG now = GetTickCount64();
+        if (rebroadcastIfDisplaced && FindWindowW(L"Shell_TrayWnd", nullptr) == g_trayWnd && now - last > 30000) { last = now; Log(L"tray host was displaced, re-registering icons"); TrayBroadcast(); }
+    }
+}
+static void CreateTrayHost() {
+    if (g_trayWnd || !g_cfg.tray) return;
+    WNDCLASSEXW tc = {sizeof(tc)}; tc.lpfnWndProc = TrayProc; tc.hInstance = GetModuleHandleW(nullptr); tc.lpszClassName = L"Shell_TrayWnd";
+    RegisterClassExW(&tc);
+    g_trayWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"Shell_TrayWnd", L"", WS_POPUP,
+                                g_winRc.left, g_winRc.top, g_winRc.right - g_winRc.left, g_winRc.bottom - g_winRc.top, nullptr, nullptr, tc.hInstance, nullptr);
+    if (!g_trayWnd) { Log(L"tray host could not be created (%lu)", GetLastError()); return; }
+    ChangeWindowMessageFilterEx(g_trayWnd, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
+    SetWindowPos(g_trayWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    Log(L"tray host ready (first Shell_TrayWnd: %ls)", FindWindowW(L"Shell_TrayWnd", nullptr) == g_trayWnd ? L"yes" : L"no");
+    TrayBroadcast();
+}
+static void DestroyTrayHost() {
+    if (!g_trayWnd) return;
+    DestroyWindow(g_trayWnd); g_trayWnd = nullptr;
+    for (auto* t : g_tray) TrayFree(t); g_tray.clear();
+    TrayBroadcast(); // icons go back to explorer (it already has them through forwarding)
+    Kick();
+}
+static void TrayCleanup() {
+    bool ch = false;
+    for (size_t i = 0; i < g_tray.size();) {
+        if (!IsWindow(g_tray[i]->hwnd)) { TrayFree(g_tray[i]); g_tray.erase(g_tray.begin() + i); ch = true; } else i++;
+    }
+    if (ch) Kick();
+}
+// Sends the click to the app the way explorer does (classic and NOTIFYICON_VERSION_4 callbacks).
+static void TrayClick(TrayIcon* t, int kind) {
+    if (!t || !t->cb || !IsWindow(t->hwnd)) return;
+    AllowSetForegroundWindow(t->pid ? t->pid : ASFW_ANY);
+    POINT pt; GetCursorPos(&pt);
+    auto post = [&](UINT m) {
+        if (t->ver >= 4) PostMessageW(t->hwnd, t->cb, MAKEWPARAM(pt.x, pt.y), MAKELPARAM(m, t->uid));
+        else PostMessageW(t->hwnd, t->cb, t->uid, m);
+    };
+    if (kind == 0) { post(WM_LBUTTONDOWN); post(WM_LBUTTONUP); if (t->ver >= 4) post(WM_USER /*NIN_SELECT*/); }
+    else if (kind == 1) { post(WM_RBUTTONDOWN); post(WM_RBUTTONUP); if (t->ver >= 4) post(WM_CONTEXTMENU); }
+    else { post(WM_LBUTTONDBLCLK); post(WM_LBUTTONUP); }
+}
+static void TrayHoverNotify(TrayIcon* t) {
+    if (!t || !t->cb || !IsWindow(t->hwnd)) return;
+    POINT pt; GetCursorPos(&pt);
+    if (t->ver >= 4) PostMessageW(t->hwnd, t->cb, MAKEWPARAM(pt.x, pt.y), MAKELPARAM(WM_MOUSEMOVE, t->uid));
+    else PostMessageW(t->hwnd, t->cb, t->uid, WM_MOUSEMOVE);
+}
+static void TrayBitmap(ID2D1RenderTarget* rt, TrayIcon* t) {
+    if (t->wic && (t->bmpGen != g_gen || !t->bmp)) { SafeRelease(t->bmp); rt->CreateBitmapFromWicBitmap(t->wic, nullptr, &t->bmp); t->bmpGen = g_gen; }
+}
+
 // ───────────────────────────── graphics device ─────────────────────────────
 static void ReleaseBrushes() { SafeRelease(g_br); SafeRelease(g_acc); SafeRelease(g_sheen); SafeRelease(g_spot); SafeRelease(g_shadow); SafeRelease(g_edge); SafeRelease(g_accGlow); SafeRelease(g_rim); }
 static void CreateBrushes(ID2D1RenderTarget* rt) {
@@ -1424,7 +1600,7 @@ static float g_popW = 0, g_popH = 0; static bool g_popShown = false, g_popTracki
 static std::vector<Tile> g_tiles; static IDWriteTextLayout* g_popLabel = nullptr; static float g_popLabelW = 0, g_popLabelH = 0;
 static int g_popHoverTile = -1, g_popPressTile = -1; static bool g_popHoverClose = false;
 static const float kTileW = 188.f, kThumbH = 112.f, kPad = 10.f, kGapT = 8.f, kTitleH = 22.f;
-enum { PM_PREVIEW = 0, PM_CONTROL = 1, PM_TODAY = 2 };
+enum { PM_PREVIEW = 0, PM_CONTROL = 1, PM_TODAY = 2, PM_TRAY = 3 };
 static int g_popMode = PM_PREVIEW;
 static float g_popCaretX = 0; static const float kCaret = 7.f;
 static HHOOK g_mouseHook = nullptr;
@@ -1452,6 +1628,8 @@ static bool UpdateAnims(float dt) {
     m |= g_hLang.ui(dt); m |= g_pLang.ui(dt); m |= g_dragLift.ui(dt);
     m |= g_focW.lay(dt); m |= g_hFocus.ui(dt); m |= g_hWeather.ui(dt); m |= g_pWeather.ui(dt); m |= g_clockRoll.step(dt, 170.f, 24.f, 0.002f);
     for (auto& b : g_fb) m |= b.hv.ui(dt);
+    for (auto* t : g_tray) { m |= t->hv.ui(dt); m |= t->appear.pop(dt); }
+    m |= g_hTrayMore.ui(dt); m |= g_pTrayMore.ui(dt);
     m |= g_popA.step(dt, 420.f, 40.f, 0.002f); m |= g_popY.lay(dt);
     for (auto& t : g_tiles) { m |= t.hover.ui(dt); m |= t.closeH.ui(dt); }
     m |= g_cpuV.step(dt, 90.f, 19.f, 0.002f); m |= g_ramV.step(dt, 90.f, 19.f, 0.002f); m |= g_batV.ui(dt);
@@ -1777,7 +1955,18 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
     else g_rLang = RF(g_rQuick.left, cy, g_rQuick.left, cy);
     if (g_cfg.weather && g_wx.ok) g_rWeather = RF(g_rLang.left - 6 - 58, cy - sb / 2, g_rLang.left - 6, cy + sb / 2);
     else g_rWeather = RF(g_rLang.left, cy, g_rLang.left, cy);
-    g_islR = RF(g_rWeather.left - 6, 0, W, H);
+    float trayRight = g_rWeather.left - ((g_cfg.weather && g_wx.ok) ? 4.f : 0.f), trayLeft = trayRight;
+    std::vector<TrayIcon*> trayVis; if (g_trayWnd) trayVis = TrayVisible();
+    for (auto* t : g_tray) t->r = RF(0, 0, 0, 0);
+    if (!trayVis.empty()) {
+        int nIn = std::min<int>((int)trayVis.size(), g_cfg.trayInline);
+        bool more = (int)trayVis.size() > nIn || nIn == 0;
+        trayLeft = trayRight - nIn * 26.f - (more ? 24.f : 0.f) - 4.f;
+        float tx = trayLeft + 2;
+        if (more) { g_rTrayMore = RF(tx, cy - 14, tx + 24, cy + 14); tx += 24; } else g_rTrayMore = RF(0, 0, 0, 0);
+        for (int i = 0; i < nIn; i++) { trayVis[i]->r = RF(tx, cy - 14, tx + 26, cy + 14); tx += 26; }
+    } else g_rTrayMore = RF(0, 0, 0, 0);
+    g_islR = RF(trayLeft - 6, 0, W, H);
 
     // ── layout: dock (magnification)
     const float maxIcon = islands ? std::min(40.f, H - 8.f) : std::min(34.f, H - 15.f), maxS = maxIcon / 24.f, dotY = cy + 16.f;
@@ -1958,6 +2147,31 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
         g_alpha = sa;
         rt->PopAxisAlignedClip();
     } else { g_rMInfo = g_rMPrev = g_rMPlay = g_rMNext = RF(0, 0, 0, 0); }
+
+    // ── tray icons + overflow button
+    if (!trayVis.empty()) {
+        for (auto* t : trayVis) {
+            if (t->r.right <= t->r.left) continue;
+            HoverChip(rt, t->r, t->hv.v, 0.f);
+            TrayBitmap(rt, t);
+            float ccx = (t->r.left + t->r.right) / 2, sz = 16.f * (0.6f + 0.4f * Clamp01(t->appear.v)) * (1.f + 0.12f * t->hv.v);
+            if (t->bmp) Bitmap(rt, t->bmp, RF(ccx - sz / 2, cy - sz / 2, ccx + sz / 2, cy + sz / 2), Clamp01(t->appear.v));
+        }
+        if (g_rTrayMore.right > g_rTrayMore.left) {
+            HoverChip(rt, g_rTrayMore, g_hTrayMore.v, g_pTrayMore.v);
+            float mx = (g_rTrayMore.left + g_rTrayMore.right) / 2; bool open = Sticky() && g_popMode == PM_TRAY && g_popA.t > 0.5f;
+            float d = (open != g_cfg.top) ? 1.f : -1.f; // chevron points to where the panel opens
+            Line(rt, mx - 4.5f, cy - 2.f * d, mx, cy + 2.5f * d, 1.6f, Col(1, 1, 1, 0.85f));
+            Line(rt, mx, cy + 2.5f * d, mx + 4.5f, cy - 2.f * d, 1.6f, Col(1, 1, 1, 0.85f));
+            int hiddenN = (int)trayVis.size() - std::min<int>((int)trayVis.size(), g_cfg.trayInline);
+            if (hiddenN > 0) { // small count badge
+                wchar_t nb[8]; swprintf(nb, 8, L"%d", hiddenN);
+                D2D1_RECT_F b = RF(g_rTrayMore.right - 11, g_rTrayMore.top + 1, g_rTrayMore.right - 1, g_rTrayMore.top + 11);
+                FillAcc(rt, b, 5.f, 0.95f); Txt(rt, nb, g_fSmallC, RF(b.left - 2, b.top - 2, b.right + 2, b.bottom + 2), Col(1, 1, 1, 1));
+            }
+        }
+        Line(rt, g_islR.left + (trayRight - g_islR.left) + 2.f, cy - 9, g_islR.left + (trayRight - g_islR.left) + 2.f, cy + 9, 1.f, Col(1, 1, 1, (g_cfg.weather && g_wx.ok) ? 0.09f : 0.f));
+    }
 
     // ── weather chip
     if (g_cfg.weather && g_wx.ok) {
@@ -2212,6 +2426,17 @@ static void OpenPopup(AppItem* it) {
     g_popA.t = 1; g_popShown = true;
     Kick();
 }
+static void OpenTipPopup(const std::wstring& text, float anchorX) {
+    if (!g_pop || g_fullscreen || text.empty() || (Sticky() && g_popA.t > 0.5f)) return;
+    bool wasShown = g_popShown && g_popA.t > 0.5f;
+    UnregisterTiles(); g_popMode = PM_PREVIEW; g_popItem = nullptr;
+    std::wstring t = text; for (auto& c : t) if (c == L'\n' || c == L'\r') c = L' ';
+    g_popLabel = Layout(t, g_fTitle, 360.f, &g_popLabelW, &g_popLabelH);
+    g_popW = g_popLabelW + 28.f; g_popH = 32.f;
+    PlacePopup(anchorX, 8.f);
+    if (!wasShown) { g_popA.v = 0; g_popA.vel = 0; }
+    g_popA.t = 1; g_popShown = true; Kick();
+}
 static LRESULT CALLBACK FlyMouseHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN) && Sticky()) {
         POINT pt = ((MSLLHOOKSTRUCT*)lp)->pt; RECT pr = {}, br = {};
@@ -2225,6 +2450,7 @@ static float TodayHeight() {
     if (g_cfg.weather) h += g_wx.ok ? 126.f : 30.f;
     return h + 30.f + 20.f + 6 * 30.f + 6.f + 34.f;
 }
+static void TrayGrid(int n, int& cols, int& rows) { cols = std::max(1, std::min(6, n)); rows = std::max(1, (n + cols - 1) / cols); }
 static void OpenFlyout(int mode, float anchorX) {
     if (!g_pop || g_fullscreen) return;
     bool same = g_popShown && g_popMode == mode && g_popA.t > 0.5f;
@@ -2232,6 +2458,7 @@ static void OpenFlyout(int mode, float anchorX) {
     g_popMode = mode; g_fbHover = g_fbPress = -1; g_armId = -1; g_volDrag = false;
     if (!same) g_fb.clear();
     if (mode == PM_CONTROL) { g_popW = 340.f; g_popH = 344.f; g_dark = IsDarkMode(); }
+    else if (mode == PM_TRAY) { int c, r; TrayGrid((int)TrayVisible().size(), c, r); g_popW = std::max(232.f, 20.f + c * 44.f); g_popH = 40.f + r * 44.f + 34.f; }
     else { SYSTEMTIME st; GetLocalTime(&st); g_calY = st.wYear; g_calM = st.wMonth; g_popW = 304.f; g_popH = TodayHeight(); if (g_cfg.weather && !g_wx.ok) WeatherTick(true); }
     PlacePopup(anchorX, 8.f);
     if (!same) { g_popA.v = 0; g_popA.vel = 0; }
@@ -2461,6 +2688,26 @@ static void DrawToday(ID2D1RenderTarget* rt) {
     FillRR(rt, nb.r, 9.f, Col(1, 1, 1, 0.05f * nb.hv.v));
     Txt(rt, L"Bildirimler ve Windows takvimi  \x203A", g_fSmallC, nb.r, Col(1, 1, 1, 0.55f + 0.35f * nb.hv.v));
 }
+static void DrawTray(ID2D1RenderTarget* rt) {
+    const float W = g_popW; auto v = TrayVisible();
+    Txt(rt, L"Arka plan uygulamaları", g_fTitle, RF(16, 10, W - 50, 30), Col(1, 1, 1, 0.95f));
+    Txt(rt, std::to_wstring(v.size()), g_fSmallR, RF(W - 60, 12, W - 16, 30), Col(1, 1, 1, 0.5f));
+    int cols, rows; TrayGrid((int)v.size(), cols, rows);
+    float gx = (W - cols * 44.f) / 2.f; std::wstring tip;
+    for (size_t i = 0; i < v.size(); i++) {
+        float x = gx + (i % cols) * 44.f, y = 38.f + (i / cols) * 44.f;
+        FlyBtn& b = Btn(1000 + (int)i, RF(x + 2, y + 2, x + 42, y + 42));
+        FillRR(rt, b.r, 11.f, Col(1, 1, 1, 0.04f + 0.08f * b.hv.v));
+        TrayBitmap(rt, v[i]);
+        float s = 20.f * (1.f + 0.1f * b.hv.v), cx = x + 22, cyy = y + 22;
+        if (v[i]->bmp) Bitmap(rt, v[i]->bmp, RF(cx - s / 2, cyy - s / 2, cx + s / 2, cyy + s / 2), 1.f);
+        if (b.hv.v > 0.5f) tip = v[i]->tip;
+    }
+    if (v.empty()) Txt(rt, L"Arka planda simgesi olan uygulama yok.", g_fTile, RF(16, 40, W - 16, 60), Col(1, 1, 1, 0.5f));
+    if (tip.empty()) tip = L"Tıkla: aç  ·  Sağ tık: menü";
+    for (auto& c : tip) if (c == L'\n' || c == L'\r') c = L' ';
+    Txt(rt, tip, g_fTile, RF(12, g_popH - 28, W - 12, g_popH - 10), Col(1, 1, 1, 0.6f));
+}
 static void DrawPreview(ID2D1RenderTarget* rt) {
     if (g_tiles.empty() && g_popLabel) TxtL(rt, g_popLabel, 14.f, (g_popH - g_popLabelH) / 2.f, Col(1, 1, 1, 0.95f));
     for (auto& t : g_tiles) {
@@ -2521,6 +2768,7 @@ static void RenderPopup() {
     g_dc->SetTransform(MMul(MTrans(0, ct), base));
     if (g_popMode == PM_CONTROL) DrawControl(g_dc);
     else if (g_popMode == PM_TODAY) DrawToday(g_dc);
+    else if (g_popMode == PM_TRAY) DrawTray(g_dc);
     else DrawPreview(g_dc);
     g_dc->SetTransform(MIdent());
     HRESULT hr = g_dc->EndDraw();
@@ -2612,10 +2860,18 @@ static LRESULT CALLBACK PopProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (g_tiles.empty() && g_popItem) { AppItem* it = g_popItem; ClosePopup(); ClickApp(it); }
             g_popPressTile = -1;
         } else if (g_fbHover >= 0 && g_fbHover == g_fbPress && g_fbHover < (int)g_fb.size()) {
-            int id = g_fb[g_fbHover].id; if (id != FB_VOL) FlyAction(id);
+            int id = g_fb[g_fbHover].id;
+            if (id >= 1000) { auto v = TrayVisible(); if (id - 1000 < (int)v.size()) { TrayIcon* t = v[id - 1000]; ClosePopupNow(); TrayClick(t, 0); } }
+            else if (id != FB_VOL) FlyAction(id);
         }
         g_fbPress = -1; return 0;
     }
+    case WM_RBUTTONUP:
+        if (g_popMode == PM_TRAY && g_fbHover >= 0 && g_fbHover < (int)g_fb.size() && g_fb[g_fbHover].id >= 1000) {
+            auto v = TrayVisible(); int i = g_fb[g_fbHover].id - 1000;
+            if (i < (int)v.size()) { TrayIcon* t = v[i]; ClosePopupNow(); TrayClick(t, 1); }
+        }
+        return 0;
     case WM_MBUTTONUP: if (g_popMode == PM_PREVIEW && g_popHoverTile >= 0 && g_popHoverTile < (int)g_tiles.size()) PostMessageW(g_tiles[g_popHoverTile].w, WM_CLOSE, 0, 0); return 0;
     case WM_MOUSEWHEEL: {
         float n = GET_WHEEL_DELTA_WPARAM(wp) / (float)WHEEL_DELTA;
@@ -2674,6 +2930,7 @@ static void Reposition() {
     g_pxW = w; g_pxH = h; g_md = (float)g_cfg.margin;
     g_monRc = mr; g_winRc = RECT{x, y, x + w, y + h};
     SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | (g_fullscreen ? 0 : SWP_SHOWWINDOW));
+    if (g_trayWnd) SetWindowPos(g_trayWnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     int corner = 1 /*DONOTROUND*/;
     DwmSetWindowAttribute(g_hwnd, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/, &corner, sizeof(corner));
     ResizeSwap();
@@ -2702,7 +2959,7 @@ static void DarkMenus() {
     auto setMode = (fnMode)GetProcAddress(ux, MAKEINTRESOURCEA(135)); auto flush = (fnFlush)GetProcAddress(ux, MAKEINTRESOURCEA(136));
     if (setMode) setMode(2 /*ForceDark*/); if (flush) flush();
 }
-enum { ID_TASKMGR = 100, ID_SETTINGS, ID_RELOAD, ID_TOGGLETB, ID_AUTOSTART, ID_TOP, ID_EXIT, ID_NEWWIN, ID_PIN, ID_CLOSE, ID_STATS, ID_TITLE, ID_CENTER, ID_MEDIA, ID_PREVIEWS, ID_TRASH, ID_STYLE, ID_EMPTYTRASH, ID_LANG, ID_WEATHER, ID_AUTOACC, ID_FOCUS };
+enum { ID_TASKMGR = 100, ID_SETTINGS, ID_RELOAD, ID_TOGGLETB, ID_AUTOSTART, ID_TOP, ID_EXIT, ID_NEWWIN, ID_PIN, ID_CLOSE, ID_STATS, ID_TITLE, ID_CENTER, ID_MEDIA, ID_PREVIEWS, ID_TRASH, ID_STYLE, ID_EMPTYTRASH, ID_LANG, ID_WEATHER, ID_AUTOACC, ID_FOCUS, ID_TRAY };
 static int ShowMenu(HMENU m) {
     POINT p; GetCursorPos(&p); SetForegroundWindow(g_hwnd);
     UINT fl = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | (g_cfg.top ? TPM_TOPALIGN : TPM_BOTTOMALIGN);
@@ -2725,6 +2982,7 @@ static void BarMenu() {
     AppendMenuW(m, MF_STRING | (g_cfg.lang ? MF_CHECKED : 0), ID_LANG, L"Klavye dili göstergesi");
     AppendMenuW(m, MF_STRING | (g_cfg.islands ? MF_CHECKED : 0), ID_STYLE, L"Ada görünümü");
     AppendMenuW(m, MF_STRING | (g_cfg.weather ? MF_CHECKED : 0), ID_WEATHER, L"Hava durumu");
+    AppendMenuW(m, MF_STRING | (g_cfg.tray ? MF_CHECKED : 0), ID_TRAY, L"Sistem tepsisi simgeleri");
     AppendMenuW(m, MF_STRING | (g_cfg.autoAccent ? MF_CHECKED : 0), ID_AUTOACC, L"Renkleri duvar kâğıdından al");
     AppendMenuW(m, MF_STRING | (g_focusOn ? MF_CHECKED : 0), ID_FOCUS, g_focusOn ? L"Odak zamanlayıcısını durdur" : L"Odak zamanlayıcısını başlat");
     AppendMenuW(m, MF_STRING | (g_cfg.top ? MF_CHECKED : 0), ID_TOP, L"Ekranın üstüne al");
@@ -2746,6 +3004,7 @@ static void BarMenu() {
     case ID_PREVIEWS: SetIniBool(L"WindowPreviews", !g_cfg.previews); reload(); break;
     case ID_TRASH: SetIniBool(L"ShowTrash", !g_cfg.trash); reload(); break;
     case ID_LANG: SetIniBool(L"ShowKeyboardLayout", !g_cfg.lang); reload(); ReadLang(); break;
+    case ID_TRAY: SetIniBool(L"ShowTray", !g_cfg.tray); reload(); if (g_cfg.tray) CreateTrayHost(); else DestroyTrayHost(); break;
     case ID_WEATHER: SetIniBool(L"ShowWeather", !g_cfg.weather); reload(); g_wxNext = 0; WeatherTick(true); break;
     case ID_AUTOACC: SetIniBool(L"AutoAccent", !g_cfg.autoAccent); reload(); g_brushDirty = true; break;
     case ID_FOCUS: if (g_focusOn) StopFocus(); else StartFocus(); break;
@@ -2801,6 +3060,8 @@ static Hit HitTest(float x, float y) {
     else if (InR(g_rClock, x, y)) h.k = RK_CLOCK;
     else if (g_langShow && InR(g_rLang, x, y)) h.k = RK_LANG;
     else if (g_cfg.weather && g_wx.ok && InR(g_rWeather, x, y)) h.k = RK_WEATHER;
+    else if (g_rTrayMore.right > g_rTrayMore.left && InR(g_rTrayMore, x, y)) h.k = RK_TRAYMORE;
+    else if ([&] { for (auto* t : g_tray) if (t->r.right > t->r.left && InR(t->r, x, y)) { h.ti = t; return true; } return false; }()) h.k = RK_TRAY;
     else if (g_focW.v > 20.f && InR(g_rFocus, x, y)) h.k = RK_FOCUS;
     else if (g_mW.v > 40.f && InR(g_rMPrev, x, y)) h.k = RK_MPREV;
     else if (g_mW.v > 40.f && InR(g_rMPlay, x, y)) h.k = RK_MPLAY;
@@ -2818,6 +3079,16 @@ static void SetHover(const Hit& h) {
     g_hMInfo.t = h.k == RK_MINFO; g_hMPrev.t = h.k == RK_MPREV; g_hMPlay.t = h.k == RK_MPLAY; g_hMNext.t = h.k == RK_MNEXT; g_hLang.t = h.k == RK_LANG;
     g_hFocus.t = h.k == RK_FOCUS; g_hWeather.t = h.k == RK_WEATHER; g_pWeather.t = p && h.k == RK_WEATHER;
     g_pMPrev.t = p && h.k == RK_MPREV; g_pMPlay.t = p && h.k == RK_MPLAY; g_pMNext.t = p && h.k == RK_MNEXT; g_pLang.t = p && h.k == RK_LANG;
+    for (auto* t : g_tray) t->hv.t = (h.k == RK_TRAY && h.ti == t) ? 1.f : 0.f;
+    g_hTrayMore.t = h.k == RK_TRAYMORE; g_pTrayMore.t = p && h.k == RK_TRAYMORE;
+    if (h.k == RK_TRAY && h.ti) {
+        if (g_hoverTray != h.ti) TrayHoverNotify(h.ti);
+        g_hoverTray = h.ti; KillTimer(g_hwnd, TMR_POPHIDE);
+        if (g_popShown && !Sticky() && g_popA.t > 0.5f) OpenTipPopup(h.ti->tip, (h.ti->r.left + h.ti->r.right) / 2);
+        else SetTimer(g_hwnd, TMR_POPUP, 500, nullptr);
+        Kick(); return;
+    }
+    g_hoverTray = nullptr;
     // window-preview popup: open after a short dwell, follow the cursor once open
     if (h.k == RK_APP && h.it && !g_dragItem) {
         KillTimer(g_hwnd, TMR_POPHIDE);
@@ -2831,7 +3102,7 @@ static void SetHover(const Hit& h) {
 }
 static void DoClick(const Hit& h) {
     // clicks on the bar close an open Control Center / Today panel, except the ones that toggle it
-    bool toggles = h.k == RK_QUICK || h.k == RK_CLOCK || h.k == RK_WEATHER;
+    bool toggles = h.k == RK_QUICK || h.k == RK_CLOCK || h.k == RK_WEATHER || h.k == RK_TRAYMORE;
     if (Sticky() && !toggles) ClosePopup();
     switch (h.k) {
     case RK_START: if (!g_shellFlyoutWasOpen) SendKeys({VK_LWIN}); break; // a second click closes Start
@@ -2841,6 +3112,8 @@ static void DoClick(const Hit& h) {
     case RK_CLOCK: if (Sticky() && g_popMode == PM_TODAY && g_popA.t > 0.5f) ClosePopup(); else OpenFlyout(PM_TODAY, (g_rClock.left + g_rClock.right) / 2); break;
     case RK_WEATHER: if (Sticky() && g_popMode == PM_TODAY && g_popA.t > 0.5f) ClosePopup(); else OpenFlyout(PM_TODAY, (g_rWeather.left + g_rWeather.right) / 2); break;
     case RK_FOCUS: if (g_focusOn) ToggleFocusPause(); else { g_focusDoneAt = 0; Kick(); } break;
+    case RK_TRAY: if (h.ti) { if (g_popShown && !Sticky()) ClosePopupNow(); TrayClick(h.ti, 0); } break;
+    case RK_TRAYMORE: if (Sticky() && g_popMode == PM_TRAY && g_popA.t > 0.5f) ClosePopup(); else OpenFlyout(PM_TRAY, (g_rTrayMore.left + g_rTrayMore.right) / 2); break;
     case RK_DESK: SendKeys({VK_LWIN, 'D'}); break;
     case RK_MPREV: MediaCmd(0); break;
     case RK_MPLAY: MediaCmd(1); break;
@@ -2881,7 +3154,8 @@ static void CALLBACK WinEvent(HWINEVENTHOOK, DWORD ev, HWND h, LONG obj, LONG ch
 // ───────────────────────────── window proc ─────────────────────────────
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_TASKBARCREATED && WM_TASKBARCREATED) {
-        if (g_cfg.hideTaskbar) SetTimer(hwnd, TMR_REHIDE, 800, nullptr);
+        if (GetTickCount64() < g_ignoreTbCreatedUntil) return 0; // our own broadcast
+        SetTimer(hwnd, TMR_REHIDE, 800, nullptr);
         return 0;
     }
     switch (msg) {
@@ -2915,6 +3189,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSELEAVE: g_tracking = false; g_mouseIn = false; g_barHover.t = 0; SetHover(Hit()); return 0;
+    case WM_LBUTTONDBLCLK: {
+        Hit dh = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale);
+        if (dh.k == RK_TRAY && dh.ti) { TrayClick(dh.ti, 2); g_suppressUp = true; return 0; }
+    }
+    // fall through: a quick second click anywhere else is just another press
     case WM_LBUTTONDOWN: {
         DismissShellFlyout();
         SetCapture(hwnd); g_press = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale); SetHover(g_hover);
@@ -2932,6 +3211,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         g_dragCand = nullptr;
         ReleaseCapture();
+        if (g_suppressUp) { g_suppressUp = false; g_press = Hit(); SetHover(h); return 0; }
         Hit p = g_press; g_press = Hit(); SetHover(h);
         if (p == h) DoClick(h);
         return 0;
@@ -2950,6 +3230,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_RBUTTONDOWN: DismissShellFlyout(); return 0;
     case WM_RBUTTONUP: {
         Hit h = HitTest(GET_X_LPARAM(lp) / g_scale, GET_Y_LPARAM(lp) / g_scale);
+        if (h.k == RK_TRAY && h.ti) { ClosePopupNow(); TrayClick(h.ti, 1); return 0; }
         ClosePopupNow();
         if (h.k == RK_APP && h.it) AppMenu(h.it);
         else if (h.k == RK_START) SendKeys({VK_LWIN, 'X'});
@@ -2974,15 +3255,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == TMR_POPUP) {
             KillTimer(hwnd, TMR_POPUP);
             if (g_hover.k == RK_APP && g_hover.it && g_hover.it == g_hoverPend && !g_dragItem && g_press.k == RK_NONE) OpenPopup(g_hoverPend);
+            else if (g_hover.k == RK_TRAY && g_hover.ti && g_hover.ti == g_hoverTray && g_press.k == RK_NONE) OpenTipPopup(g_hover.ti->tip, (g_hover.ti->r.left + g_hover.ti->r.right) / 2);
         }
         else if (wp == TMR_POPHIDE) {
             KillTimer(hwnd, TMR_POPHIDE);
             if (Sticky()) return 0;
             POINT pt; GetCursorPos(&pt); RECT pr = {};
             if (g_pop && g_popShown) GetWindowRect(g_pop, &pr);
-            if (!(g_popShown && PtInRect(&pr, pt)) && !(g_hover.k == RK_APP && g_hover.it)) ClosePopup();
+            if (!(g_popShown && PtInRect(&pr, pt)) && !(g_hover.k == RK_APP && g_hover.it) && !(g_hover.k == RK_TRAY && g_hover.ti)) ClosePopup();
         }
-        else if (wp == TMR_REHIDE) { KillTimer(hwnd, TMR_REHIDE); g_abRegistered = false; if (g_cfg.hideTaskbar) HideWinTaskbar(); Reposition(); RefreshWindows(); }
+        else if (wp == TMR_REHIDE) { KillTimer(hwnd, TMR_REHIDE); g_abRegistered = false; if (g_cfg.hideTaskbar) HideWinTaskbar(); Reposition(); RefreshWindows(); if (g_trayWnd) { TrayKeepOnTop(false); TrayBroadcast(); } }
         else if (wp == TMR_POLL) {
             g_tick++;
             ReadClock(); ReadStats(); ReadVolume(); ReadNetSpeed(); FocusTick(); WeatherTick();
@@ -2991,8 +3273,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_tick % 6 == 0) { if (!g_epv) AcquireVolume(); }
             if (g_tick % 3 == 0) RefreshWindows();
             if (g_tick % 6 == 0 && g_cfg.trash) ReadTrash();
+            if (g_tick % 2 == 0 && g_trayWnd) { TrayKeepOnTop(true); TrayCleanup(); }
             if (g_tick % 5 == 0) { std::wstring k = g_wallKey; BuildWallpaper(); if (k != g_wallKey) Kick(); }
-            if (g_cfg.hideTaskbar && g_tbHidden) { HWND tb = FindWindowW(L"Shell_TrayWnd", nullptr); if (tb && IsWindowVisible(tb)) ForEachTaskbar(false); }
+            if (g_cfg.hideTaskbar && g_tbHidden) { HWND tb = ExplorerTray(); if (tb && IsWindowVisible(tb)) ForEachTaskbar(false); }
         }
         return 0;
     case WM_WEATHER: {
@@ -3019,11 +3302,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SYSCOLORCHANGE: BuildWallpaper(); Kick(); return 0;
     case WM_PAINT: { ValidateRect(hwnd, nullptr); Kick(); return 0; }
     case WM_QUERYENDSESSION: return TRUE;
-    case WM_ENDSESSION: if (wp) { if (g_tbHidden) RestoreWinTaskbar(); } return 0;
+    case WM_ENDSESSION: if (wp) { if (g_tbHidden) RestoreWinTaskbar(); DestroyTrayHost(); } return 0;
     case WM_DESTROY: {
         KillTimer(hwnd, TMR_POLL);
         APPBARDATA abd = {sizeof(abd)}; abd.hWnd = hwnd; SHAppBarMessage(ABM_REMOVE, &abd);
         if (g_tbHidden) RestoreWinTaskbar();
+        DestroyTrayHost();
         PostQuitMessage(0); return 0;
     }
     }
@@ -3070,7 +3354,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     typedef LONG(WINAPI * fnRtl)(PRTL_OSVERSIONINFOW);
     if (auto rtl = (fnRtl)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion")) { RTL_OSVERSIONINFOW v = {sizeof(v)}; rtl(&v); g_win11 = v.dwBuildNumber >= 22000; }
 
-    WNDCLASSEXW wc = {sizeof(wc)}; wc.lpfnWndProc = WndProc; wc.hInstance = hi; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    WNDCLASSEXW wc = {sizeof(wc)}; wc.style = CS_DBLCLKS; wc.lpfnWndProc = WndProc; wc.hInstance = hi; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = L"NovaBarWnd"; wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
     RegisterClassExW(&wc);
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_ACCEPTFILES, wc.lpszClassName, L"NovaBar",
@@ -3102,6 +3386,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR cmd, int) {
     SetTimer(g_hwnd, TMR_POLL, 1000, nullptr);
     SetTimer(g_hwnd, TMR_FAST, 400, nullptr);
     ReadLang(); if (g_cfg.trash) ReadTrash(); ReadNetSpeed(); WeatherTick(true);
+    CreateTrayHost();
     HWINEVENTHOOK hk[5];
     hk[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     hk[1] = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr, WinEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
