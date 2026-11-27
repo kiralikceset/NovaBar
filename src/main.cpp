@@ -100,7 +100,7 @@ struct Config {
     bool media = true, previews = true, trash = true, lang = true;
     bool weather = true, autoAccent = true, tray = true; int focusMin = 25, trayInline = 3; std::wstring city = L"Istanbul";
 } g_cfg;
-struct Pin { std::wstring key, target; };
+struct Pin { std::wstring key, target, exe; };   // exe (lower case) lets an app pinned by its AppUserModelID still match and launch
 static std::vector<Pin> g_pins;
 static std::wstring g_iniPath, g_exePath, g_dataDir; static bool g_packaged = false;
 
@@ -185,14 +185,16 @@ static void LoadConfig() {
     for (int i = 0; i < n && i < 64; i++) {
         std::wstring v = IniGet(L"Pins", std::to_wstring(i).c_str(), L"");
         size_t p = v.find(L'|'); if (p == std::wstring::npos || p == 0) continue;
-        g_pins.push_back({Lower(v.substr(0, p)), v.substr(p + 1)});
+        std::wstring rest = v.substr(p + 1), exe; size_t q = rest.find(L'|');
+        if (q != std::wstring::npos) { exe = Lower(rest.substr(q + 1)); rest = rest.substr(0, q); }
+        g_pins.push_back({Lower(v.substr(0, p)), rest, exe});
     }
 }
 static void SavePins() {
     WritePrivateProfileStringW(L"Pins", nullptr, nullptr, g_iniPath.c_str());
     WritePrivateProfileStringW(L"Pins", L"Count", std::to_wstring(g_pins.size()).c_str(), g_iniPath.c_str());
     for (size_t i = 0; i < g_pins.size(); i++)
-        WritePrivateProfileStringW(L"Pins", std::to_wstring(i).c_str(), (g_pins[i].key + L"|" + g_pins[i].target).c_str(), g_iniPath.c_str());
+        WritePrivateProfileStringW(L"Pins", std::to_wstring(i).c_str(), (g_pins[i].key + L"|" + g_pins[i].target + (g_pins[i].exe.empty() ? L"" : L"|" + g_pins[i].exe)).c_str(), g_iniPath.c_str());
 }
 
 // ───────────────────────────── state ─────────────────────────────
@@ -205,7 +207,7 @@ static UINT WM_TASKBARCREATED = 0;
 #define WM_REFRESH (WM_APP + 2)
 #define WM_WEATHER (WM_APP + 5)
 #define WM_CLOSEFLY (WM_APP + 6)
-enum { TMR_POLL = 1, TMR_REFRESH = 2, TMR_VOLHIDE = 3, TMR_REHIDE = 4, TMR_FAST = 5, TMR_POPUP = 6, TMR_POPHIDE = 7, TMR_RETRY = 8 };
+enum { TMR_POLL = 1, TMR_REFRESH = 2, TMR_VOLHIDE = 3, TMR_REHIDE = 4, TMR_FAST = 5, TMR_POPUP = 6, TMR_POPHIDE = 7, TMR_RETRY = 8, TMR_ACTIVATE = 9 };
 static void Log(const wchar_t* fmt, ...);
 
 static ID2D1Factory1* g_d2d = nullptr;
@@ -275,6 +277,7 @@ static RECT g_winRc = {}, g_monRc = {};
 static float g_md = 8.f;
 static Spring g_divW;
 static D2D1_RECT_F g_islL, g_islC, g_islR, g_rTrayMore = {};
+static TrayIcon* g_trayClicked = nullptr;   // icon just clicked: no tooltip / hover messages until the cursor leaves it
 static TrayIcon* g_hoverTray = nullptr; static Spring g_hTrayMore, g_pTrayMore; static bool g_suppressUp = false;
 // media / extras / drag / popup shared state
 static Spring g_mW, g_mA, g_mPlayT, g_hMInfo, g_hMPrev, g_hMPlay, g_hMNext, g_pMPrev, g_pMPlay, g_pMNext, g_hLang, g_pLang;
@@ -471,7 +474,7 @@ static bool IsTaskWindow(HWND h) {
     if ((ex & WS_EX_NOACTIVATE) && !(ex & WS_EX_APPWINDOW)) return false;
     int cloaked = 0; DwmGetWindowAttribute(h, 14 /*DWMWA_CLOAKED*/, &cloaked, sizeof(cloaked));
     if (cloaked) return false;
-    if (GetWindowTextLengthW(h) == 0) return false;
+    { wchar_t t[4]; if (InternalGetWindowText(h, t, 4) == 0) return false; }   // no message: works for admin windows too
     wchar_t cls[64]; GetClassNameW(h, cls, 64);
     if (!wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd") || !wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW")) return false;
     return true;
@@ -499,7 +502,11 @@ static WinInfo& GetInfo(HWND h) {
     bool isExplorer = le.size() >= 12 && le.compare(le.size() - 12, 12, L"explorer.exe") == 0;
     if (isExplorer) wi.aumid.clear();
     wi.key = Lower(!wi.aumid.empty() ? wi.aumid : (!wi.exe.empty() ? wi.exe : std::to_wstring((uintptr_t)h)));
-    { std::wstring le2 = Lower(wi.exe); for (auto& p : g_pins) if (!le2.empty() && p.key == le2) { wi.key = p.key; break; } }
+    {   // a pinned app keeps its icon: match by AppUserModelID first, then by the program file
+        std::wstring le2 = Lower(wi.exe), la = Lower(wi.aumid); bool hit = false;
+        if (!la.empty()) for (auto& p : g_pins) if (p.key == la) { wi.key = p.key; hit = true; break; }
+        if (!hit && !le2.empty()) for (auto& p : g_pins) if (p.key == le2 || p.exe == le2) { wi.key = p.key; break; }
+    }
     g_winCache[h] = wi; return g_winCache[h];
 }
 static BOOL CALLBACK EnumCollect(HWND h, LPARAM lp) { if (IsTaskWindow(h)) ((std::vector<HWND>*)lp)->push_back(h); return TRUE; }
@@ -534,6 +541,7 @@ static void RefreshWindows() {
         auto f = std::find_if(g_items.begin(), g_items.end(), [&](AppItem* a) { return a->key == g_pins[i].key; });
         if (f == g_items.end()) {
             AppItem* it = NewItem(g_pins[i].key); it->target = g_pins[i].target;
+            if (!g_pins[i].exe.empty()) it->exe = g_pins[i].exe;
             if (g_pins[i].target.find(L'\\') != std::wstring::npos) it->exe = g_pins[i].target;
             else if (g_pins[i].target.rfind(L"shell:AppsFolder\\", 0) == 0) it->aumid = g_pins[i].target.substr(17);
             else if (g_pins[i].key.find(L'\\') != std::wstring::npos) it->exe = g_pins[i].key;
@@ -1137,7 +1145,7 @@ static bool PinPath(const std::wstring& path) {
     std::wstring key = Lower(path);
     if (key.size() > 4 && key.compare(key.size() - 4, 4, L".lnk") == 0) { std::wstring t = ResolveLnk(path); if (!t.empty()) key = Lower(t); }
     for (auto& p : g_pins) if (p.key == key) return false;
-    g_pins.push_back({key, path});
+    g_pins.push_back({key, path, key.find(L".exe") != std::wstring::npos ? key : L""});
     return true;
 }
 
@@ -1194,14 +1202,45 @@ static void SendKeys(std::initializer_list<WORD> keys) {
     for (auto it = keys.end(); it != keys.begin();) { --it; INPUT i = {}; i.type = INPUT_KEYBOARD; i.ki.wVk = *it; i.ki.dwFlags = KEYEVENTF_KEYUP | (*it == VK_LWIN ? KEYEVENTF_EXTENDEDKEY : 0); in.push_back(i); }
     SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
 }
-static void ActivateWin(HWND w) {
-    if (IsIconic(w)) ShowWindowAsync(w, SW_RESTORE);
+static HWND g_actWnd = nullptr; static int g_actTries = 0;
+static void PushForeground(HWND w) {
+    if (IsIconic(w)) { ShowWindowAsync(w, SW_RESTORE); SwitchToThisWindow(w, TRUE); }   // Alt+Tab-style restore works on admin windows too
     if (!SetForegroundWindow(w)) SwitchToThisWindow(w, TRUE);
+    BringWindowToTop(w);
 }
+static void ActivateWin(HWND w) {
+    if (!w || !IsWindow(w)) return;
+    DWORD pid = 0; GetWindowThreadProcessId(w, &pid); AllowSetForegroundWindow(pid);
+    PushForeground(w);
+    g_actWnd = w; g_actTries = 0; SetTimer(g_hwnd, TMR_ACTIVATE, 120, nullptr);   // check that it really came up
+}
+static void ActivateCheck() {
+    HWND w = g_actWnd; HWND fg = GetForegroundWindow(); HWND fr = fg ? GetAncestor(fg, GA_ROOTOWNER) : nullptr;
+    if (!w || !IsWindow(w) || ((fg == w || fr == w) && !IsIconic(w))) { KillTimer(g_hwnd, TMR_ACTIVATE); g_actWnd = nullptr; return; }
+    if (++g_actTries > 4) {
+        wchar_t t[128] = {}; InternalGetWindowText(w, t, 128);
+        Log(L"window did not come to front: %ls", t);
+        KillTimer(g_hwnd, TMR_ACTIVATE); g_actWnd = nullptr; return;
+    }
+    // first just try again (the app may simply be slow); if Windows' foreground lock still refuses,
+    // a lone Alt tap unlocks it
+    if (g_actTries >= 3) {
+        INPUT in[2] = {}; in[0].type = in[1].type = INPUT_KEYBOARD; in[0].ki.wVk = in[1].ki.wVk = VK_MENU; in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, in, sizeof(INPUT));
+    }
+    PushForeground(w);
+}
+static bool ShellOpen(const std::wstring& t) {
+    SHELLEXECUTEINFOW se = {sizeof(se)}; se.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC; se.lpVerb = L"open"; se.lpFile = t.c_str(); se.nShow = SW_SHOWNORMAL;
+    return ShellExecuteExW(&se) != FALSE;
+}
+// Tries the pinned target, then the app's ID, then the program file, so a stale entry still opens the app.
 static void Launch(AppItem* it) {
-    std::wstring t = !it->target.empty() ? it->target : (!it->aumid.empty() ? L"shell:AppsFolder\\" + it->aumid : it->exe);
-    if (t.empty()) return;
-    ShellExecuteW(nullptr, L"open", t.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    std::vector<std::wstring> tries;
+    auto add = [&](const std::wstring& t) { if (!t.empty() && std::find(tries.begin(), tries.end(), t) == tries.end()) tries.push_back(t); };
+    add(it->target); if (!it->aumid.empty()) add(L"shell:AppsFolder\\" + it->aumid); add(it->exe);
+    AllowSetForegroundWindow(ASFW_ANY);
+    for (auto& t : tries) { if (ShellOpen(t)) return; Log(L"could not open %ls (error %lu)", t.c_str(), GetLastError()); }
 }
 static void ClickApp(AppItem* it) {
     it->ripple = 0.f; Kick();
@@ -1429,7 +1468,7 @@ static std::vector<TrayIcon*> TrayVisible() {
     return v;
 }
 static void TrayFree(TrayIcon* t) {
-    if (g_hover.ti == t) g_hover = Hit(); if (g_press.ti == t) g_press = Hit(); if (g_hoverTray == t) g_hoverTray = nullptr;
+    if (g_hover.ti == t) g_hover = Hit(); if (g_press.ti == t) g_press = Hit(); if (g_hoverTray == t) g_hoverTray = nullptr; if (g_trayClicked == t) g_trayClicked = nullptr;
     SafeRelease(t->bmp); SafeRelease(t->wic); if (t->icon) DestroyIcon(t->icon); delete t;
 }
 static void TrayApply(TrayIcon* t, const NID32& n) {
@@ -1540,7 +1579,13 @@ static void TrayCleanup() {
 // Sends the click to the app the way explorer does (classic and NOTIFYICON_VERSION_4 callbacks).
 static void TrayClick(TrayIcon* t, int kind) {
     if (!t || !t->cb || !IsWindow(t->hwnd)) return;
-    AllowSetForegroundWindow(t->pid ? t->pid : ASFW_ANY);
+    g_trayClicked = t;
+    // With explorer the taskbar is the foreground window when an icon is clicked, and apps count on that:
+    // their menu or panel takes the foreground from it and closes again as soon as it loses it.
+    // NovaBar normally never takes focus, so do what the taskbar does just for this click.
+    SetForegroundWindow(g_hwnd);
+    DWORD pid = t->pid; if (!pid) GetWindowThreadProcessId(t->hwnd, &pid);
+    AllowSetForegroundWindow(pid ? pid : ASFW_ANY);
     POINT pt; GetCursorPos(&pt);
     auto post = [&](UINT m) {
         if (t->ver >= 4) PostMessageW(t->hwnd, t->cb, MAKEWPARAM(pt.x, pt.y), MAKELPARAM(m, t->uid));
@@ -3185,9 +3230,19 @@ static void AppMenu(AppItem* it) {
     else if (r == ID_PIN) {
         if (it->pinned) g_pins.erase(std::remove_if(g_pins.begin(), g_pins.end(), [&](const Pin& p) { return p.key == it->key; }), g_pins.end());
         else {
-            std::wstring tgt = !it->aumid.empty() ? L"shell:AppsFolder\\" + it->aumid : it->exe;
+            // a desktop program is pinned by its file (always launchable); a Store app, or an app whose
+            // AppUserModelID Windows can launch, by that ID
+            std::wstring tgt;
+            if (!it->aumid.empty()) {
+                IShellItem* si = nullptr;
+                if (SUCCEEDED(SHCreateItemFromParsingName((L"shell:AppsFolder\\" + it->aumid).c_str(), nullptr, IID_IShellItem, (void**)&si)) && si) { si->Release(); tgt = L"shell:AppsFolder\\" + it->aumid; }
+            }
+            if (tgt.empty() && !it->exe.empty()) {
+                tgt = it->exe; it->key = Lower(it->exe);
+                for (auto* o : g_items) if (o != it && o->key == it->key && !o->pinned) o->key = L"::merged"; // its windows join this icon
+            }
             if (tgt.empty()) return;
-            g_pins.push_back({it->key, tgt}); it->target = tgt;
+            g_pins.push_back({it->key, tgt, Lower(it->exe)}); it->target = tgt;
             // move to end of pinned block
             auto f = std::find(g_items.begin(), g_items.end(), it); g_items.erase(f);
             size_t pos = 0; for (auto* o : g_items) { if (o->pinned) pos++; else break; }
@@ -3228,6 +3283,8 @@ static void SetHover(const Hit& h) {
     g_pMPrev.t = p && h.k == RK_MPREV; g_pMPlay.t = p && h.k == RK_MPLAY; g_pMNext.t = p && h.k == RK_MNEXT; g_pLang.t = p && h.k == RK_LANG;
     for (auto* t : g_tray) t->hv.t = (h.k == RK_TRAY && h.ti == t) ? 1.f : 0.f;
     g_hTrayMore.t = h.k == RK_TRAYMORE; g_pTrayMore.t = p && h.k == RK_TRAYMORE;
+    if (g_trayClicked && !(h.k == RK_TRAY && h.ti == g_trayClicked)) g_trayClicked = nullptr;
+    if (h.k == RK_TRAY && h.ti && h.ti == g_trayClicked) { g_hoverTray = h.ti; KillTimer(g_hwnd, TMR_POPUP); Kick(); return; }
     if (h.k == RK_TRAY && h.ti) {
         if (g_hoverTray != h.ti) TrayHoverNotify(h.ti);
         g_hoverTray = h.ti; KillTimer(g_hwnd, TMR_POPHIDE);
@@ -3399,10 +3456,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         else if (wp == TMR_VOLHIDE) { KillTimer(hwnd, TMR_VOLHIDE); g_volShow.t = 0; Kick(); }
         else if (wp == TMR_FAST) { MediaPoll(); ReadLang(); CheckFullscreen(); }
         else if (wp == TMR_RETRY) { KillTimer(hwnd, TMR_RETRY); Kick(); }
+        else if (wp == TMR_ACTIVATE) ActivateCheck();
         else if (wp == TMR_POPUP) {
             KillTimer(hwnd, TMR_POPUP);
             if (g_hover.k == RK_APP && g_hover.it && g_hover.it == g_hoverPend && !g_dragItem && g_press.k == RK_NONE) OpenPopup(g_hoverPend);
-            else if (g_hover.k == RK_TRAY && g_hover.ti && g_hover.ti == g_hoverTray && g_press.k == RK_NONE) OpenTipPopup(g_hover.ti->tip, (g_hover.ti->r.left + g_hover.ti->r.right) / 2);
+            else if (g_hover.k == RK_TRAY && g_hover.ti && g_hover.ti == g_hoverTray && g_hover.ti != g_trayClicked && g_press.k == RK_NONE) OpenTipPopup(g_hover.ti->tip, (g_hover.ti->r.left + g_hover.ti->r.right) / 2);
         }
         else if (wp == TMR_POPHIDE) {
             KillTimer(hwnd, TMR_POPHIDE);
