@@ -55,6 +55,10 @@ Ayarlar exe'nin yanındaki `NovaBar.ini` dosyasında (sağ tık → *Ayar dosyas
 
 Store sürümü ayarlarını uygulamanın kendi klasöründe (`%LOCALAPPDATA%\Packages\…\LocalState`) tutar ve Windows ile başlatmak için paketin başlangıç görevini kullanır. Gizlilik politikası: [PRIVACY.md](PRIVACY.md).
 
+## Arama çubuğu
+
+Başlat düğmesinin yanında duran arama çubuğuna tıklayınca Windows Arama açılır, yazdıklarına oradan devam edersin. Tekrar tıklarsan kapanır. Kapatmak için bara sağ tıkla ve "Arama çubuğu"nun işaretini kaldır (ini dosyasında `ShowSearch=0`).
+
 ## Kendini toparlama
 
 - **Bekçi süreci:** `NovaBar.exe` önce küçük bir bekçi olarak açılır ve asıl barı `NovaBar.exe --child` olarak başlatır. Bu yüzden Görev Yöneticisi'nde iki NovaBar görürsün. Bar çökerse ya da ~25 sn donarsa bekçi önce Windows görev çubuğunu geri getirir, sonra barı yeniden açar. Bar 3 dakikada 5 kez çökerse bekçi pes eder ve ekranda Windows görev çubuğu kalır.

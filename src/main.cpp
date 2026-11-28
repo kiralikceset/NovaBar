@@ -98,7 +98,7 @@ struct Config {
     uint32_t accent = 0x7AA2FF, accent2 = 0xB983FF;
     bool center = true, stats = true, title = true, hideTaskbar = true, islands = true;
     bool media = true, previews = true, trash = true, lang = true;
-    bool weather = true, autoAccent = true, tray = true; int focusMin = 25, trayInline = 3; std::wstring city = L"Istanbul";
+    bool weather = true, autoAccent = true, tray = true, search = true; int focusMin = 25, trayInline = 3; std::wstring city = L"Istanbul";
 } g_cfg;
 struct Pin { std::wstring key, target, exe; };   // exe (lower case) lets an app pinned by its AppUserModelID still match and launch
 static std::vector<Pin> g_pins;
@@ -143,6 +143,7 @@ static void WriteDefaultIni() {
         L"ShowKeyboardLayout=1\r\n"
         L"; Hava durumu (open-meteo.com) için şehir\r\n"
         L"ShowWeather=1\r\n"
+        L"ShowSearch=1\r\n"
         L"WeatherCity=Istanbul\r\n"
         L"; 1 = vurgu renklerini duvar kâğıdından al (Accent/Accent2 yok sayılır)\r\n"
         L"AutoAccent=1\r\n"
@@ -175,6 +176,7 @@ static void LoadConfig() {
     g_cfg.trash = IniInt(L"Bar", L"ShowTrash", 1) != 0;
     g_cfg.lang = IniInt(L"Bar", L"ShowKeyboardLayout", 1) != 0;
     g_cfg.weather = IniInt(L"Bar", L"ShowWeather", 1) != 0;
+    g_cfg.search = IniInt(L"Bar", L"ShowSearch", 1) != 0;
     g_cfg.city = IniGet(L"Bar", L"WeatherCity", L"Istanbul"); if (g_cfg.city.empty()) g_cfg.city = L"Istanbul";
     g_cfg.autoAccent = IniInt(L"Bar", L"AutoAccent", 1) != 0;
     g_cfg.tray = IniInt(L"Bar", L"ShowTray", 1) != 0;
@@ -228,7 +230,7 @@ static ID2D1SolidColorBrush* g_br = nullptr;
 static ID2D1LinearGradientBrush* g_acc = nullptr;
 static ID2D1LinearGradientBrush* g_sheen = nullptr; static ID2D1LinearGradientBrush* g_rim = nullptr;
 static ID2D1RadialGradientBrush *g_spot = nullptr, *g_shadow = nullptr, *g_edge = nullptr, *g_accGlow = nullptr;
-static IDWriteTextFormat *g_fBig = nullptr, *g_fMid = nullptr, *g_fSmallC = nullptr, *g_fSmallR = nullptr, *g_fCal = nullptr, *g_fIconL = nullptr, *g_fStatC = nullptr, *g_fTile = nullptr, *g_fStatV = nullptr, *g_fTime = nullptr, *g_fDate = nullptr, *g_fSmall = nullptr, *g_fTitle = nullptr, *g_fIcon = nullptr, *g_fIconS = nullptr, *g_fLetter = nullptr;
+static IDWriteTextFormat *g_fSearch = nullptr, *g_fBig = nullptr, *g_fMid = nullptr, *g_fSmallC = nullptr, *g_fSmallR = nullptr, *g_fCal = nullptr, *g_fIconL = nullptr, *g_fStatC = nullptr, *g_fTile = nullptr, *g_fStatV = nullptr, *g_fTime = nullptr, *g_fDate = nullptr, *g_fSmall = nullptr, *g_fTitle = nullptr, *g_fIcon = nullptr, *g_fIconS = nullptr, *g_fLetter = nullptr;
 static IDWriteInlineObject *g_ellipsis = nullptr, *g_ellipsis2 = nullptr, *g_ellipsis3 = nullptr;
 static float g_alpha = 1.f;
 
@@ -247,7 +249,7 @@ struct AppItem {
 };
 static std::vector<AppItem*> g_items;
 
-enum RK { RK_NONE, RK_START, RK_APP, RK_STATS, RK_QUICK, RK_CLOCK, RK_DESK, RK_MINFO, RK_MPREV, RK_MPLAY, RK_MNEXT, RK_LANG, RK_FOCUS, RK_WEATHER, RK_TRAY, RK_TRAYMORE };
+enum RK { RK_NONE, RK_START, RK_APP, RK_STATS, RK_QUICK, RK_CLOCK, RK_DESK, RK_MINFO, RK_MPREV, RK_MPLAY, RK_MNEXT, RK_LANG, RK_FOCUS, RK_WEATHER, RK_TRAY, RK_TRAYMORE, RK_SEARCH };
 // system-tray icons hosted by NovaBar (see "system tray host" below)
 struct TrayIcon {
     HWND hwnd = nullptr; UINT uid = 0; GUID guid = {}; bool hasGuid = false; UINT cb = 0; UINT ver = 0;
@@ -267,7 +269,7 @@ struct Hit { RK k = RK_NONE; AppItem* it = nullptr; TrayIcon* ti = nullptr; bool
 static Hit g_hover, g_press;
 static Spring g_hStart, g_pStart, g_hStats, g_hQuick, g_pQuick, g_hClock, g_pClock, g_hDesk, g_pDesk;
 static Spring g_indX, g_indW, g_indA, g_enter, g_mouseX, g_barHover, g_volShow, g_volV, g_cpuV, g_ramV, g_batV;
-static D2D1_RECT_F g_rStart, g_rStats, g_rQuick, g_rClock, g_rDesk;
+static D2D1_RECT_F g_rStart, g_rStats, g_rQuick, g_rClock, g_rDesk, g_rSearch;
 static std::vector<uint32_t> g_wallPx; static int g_wallW = 0, g_wallH = 0, g_wallDown = 2, g_wallPad = 0;
 static std::wstring g_wallKey; static bool g_wallDirty = false; static int g_wallGen = -1;
 static ID2D1Bitmap* g_wallBmp = nullptr; static ID2D1BitmapBrush* g_wallBrush = nullptr;
@@ -341,6 +343,7 @@ static void CreateTextResources() {
     g_fDate = MakeFormat(ui, 10.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_fSmall = MakeFormat(ui, 9.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
     g_fTitle = MakeFormat(ui, 12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g_fSearch = MakeFormat(ui, 12.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
     g_fIcon = MakeFormat(ico, 14.5f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_fIconS = MakeFormat(ico, 8.f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_fLetter = MakeFormat(disp, 13.f, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -581,6 +584,7 @@ static void RefreshWindows() {
         } else if (f != g_items.end() && (*f)->alive) { (*f)->alive = false; (*f)->appear.t = 0; changed = true; }
     }
     { std::vector<AppItem*> snap = g_items; for (auto* it : snap) if (!it->iconTried) LoadItemIcon(it); }
+    if (g_fg && !IsWindow(g_fg)) g_fg = nullptr;
     UpdateActive();
     PopupSync();
     if (changed) Kick();
@@ -589,7 +593,10 @@ static void RefreshWindows() {
 static HWND RootOwner(HWND h) { HWND r = h ? GetAncestor(h, GA_ROOTOWNER) : nullptr; return r ? r : h; }
 static void UpdateActive() {
     HWND fg = RootOwner(GetForegroundWindow());
-    if (fg == g_hwnd) return; // our menus etc. — keep previous
+    // while our own bar/menu/panel is in front, keep the last app window lit, but only while it still
+    // exists and is on screen: closing a window from the bar used to leave its icon highlighted
+    if (fg == g_hwnd || (g_pop && fg == g_pop) || (g_trayWnd && fg == g_trayWnd))
+        fg = (g_fg && IsWindow(g_fg) && IsWindowVisible(g_fg) && !IsIconic(g_fg)) ? g_fg : nullptr;
     g_fg = fg;
     bool any = false;
     for (auto* it : g_items) {
@@ -1741,7 +1748,7 @@ static std::vector<FlyBtn> g_fb; static int g_fbHover = -1, g_fbPress = -1;
 static bool g_volDrag = false; static D2D1_RECT_F g_volTrack = {};
 static int g_armId = -1; static ULONGLONG g_armTime = 0;
 static int g_calY = 2026, g_calM = 1; static bool g_dark = false;
-static Spring g_focW, g_hFocus, g_hWeather, g_pWeather;
+static Spring g_focW, g_hFocus, g_hWeather, g_pWeather, g_hSearch, g_pSearch;
 static D2D1_RECT_F g_rFocus, g_rWeather;
 enum { FB_MUTE = 1, FB_DARK, FB_FOCUS, FB_SNIP, FB_CLIP, FB_EMOJI, FB_WIFI, FB_BT, FB_SETTINGS, FB_LOCK, FB_SLEEP, FB_RESTART, FB_SHUTDOWN, FB_QUICK, FB_CALPREV, FB_CALNEXT, FB_NOTIF, FB_VOL };
 static bool Sticky() { return g_popShown && g_popMode != PM_PREVIEW; }
@@ -1758,7 +1765,7 @@ static bool UpdateAnims(float dt) {
     m |= g_mW.lay(dt); m |= g_mA.ui(dt); m |= g_mPlayT.step(dt, 320.f, 26.f, 0.002f);
     m |= g_hMInfo.ui(dt); m |= g_hMPrev.ui(dt); m |= g_hMPlay.ui(dt); m |= g_hMNext.ui(dt); m |= g_pMPrev.ui(dt); m |= g_pMPlay.ui(dt); m |= g_pMNext.ui(dt);
     m |= g_hLang.ui(dt); m |= g_pLang.ui(dt); m |= g_dragLift.ui(dt);
-    m |= g_focW.lay(dt); m |= g_hFocus.ui(dt); m |= g_hWeather.ui(dt); m |= g_pWeather.ui(dt); m |= g_clockRoll.step(dt, 170.f, 24.f, 0.002f);
+    m |= g_focW.lay(dt); m |= g_hFocus.ui(dt); m |= g_hWeather.ui(dt); m |= g_pWeather.ui(dt); m |= g_hSearch.ui(dt); m |= g_pSearch.ui(dt); m |= g_clockRoll.step(dt, 170.f, 24.f, 0.002f);
     for (auto& b : g_fb) m |= b.hv.ui(dt);
     for (auto* t : g_tray) { m |= t->hv.ui(dt); m |= t->appear.pop(dt); }
     m |= g_hTrayMore.ui(dt); m |= g_pTrayMore.ui(dt);
@@ -2059,6 +2066,8 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
     const float sb = std::min(36.f, H - 10.f);
     g_rStart = RF(6, cy - sb / 2, 6 + sb, cy + sb / 2);
     float leftEnd = g_rStart.right + 6;
+    if (g_cfg.search) { float sw = W > 1500.f ? 210.f : (W > 1100.f ? 168.f : 120.f); g_rSearch = RF(leftEnd, cy - sb / 2 + 2, leftEnd + sw, cy + sb / 2 - 2); leftEnd = g_rSearch.right + 8; }
+    else g_rSearch = RF(0, 0, 0, 0);
     if (g_cfg.stats) { g_rStats = RF(leftEnd, cy - sb / 2, leftEnd + 130, cy + sb / 2); leftEnd = g_rStats.right + 6; }
     else g_rStats = RF(0, 0, 0, 0);
     { float ft = FocusVisible() ? 86.f : 0.f; if (g_focW.t != ft) { g_focW.t = ft; more = true; } }
@@ -2161,6 +2170,27 @@ static void DrawScene(ID2D1RenderTarget* rt, float Wwin, float Hwin, bool& more)
             }
         }
         rt->SetTransform(base);
+    }
+
+    // ── search bar: opens Windows Search, where typing goes straight in
+    if (g_cfg.search && g_rSearch.right > g_rSearch.left) {
+        const D2D1_RECT_F r = g_rSearch; float h = Clamp01(g_hSearch.v), p = Clamp01(g_pSearch.v), rr = (r.bottom - r.top) / 2;
+        D2D1_RECT_F q = RF(r.left + 1.5f * p, r.top + 1.f * p, r.right - 1.5f * p, r.bottom - 1.f * p);
+        FillRR(rt, q, rr, Col(1, 1, 1, 0.075f + 0.05f * h + 0.03f * p));
+        FillRR(rt, RF(q.left, q.top, q.right, (q.top + q.bottom) / 2), rr, Col(1, 1, 1, 0.025f + 0.02f * h));
+        StrokeRR(rt, RF(q.left + 0.5f, q.top + 0.5f, q.right - 0.5f, q.bottom - 0.5f), rr - 0.5f, Col(1, 1, 1, 0.08f + 0.10f * h));
+        // magnifier: accent ring + handle
+        float mx = q.left + 15.f, my = cy - 0.5f, mr = 5.2f;
+        if (g_acc) {
+            g_acc->SetStartPoint(PT(mx - 7, my - 7)); g_acc->SetEndPoint(PT(mx + 7, my + 7)); g_acc->SetOpacity(g_alpha);
+            D2D1_ELLIPSE e = {PT(mx - 1.f, my - 1.f), mr, mr}; rt->DrawEllipse(&e, g_acc, 1.9f);
+            rt->DrawLine(PT(mx + 2.8f, my + 2.8f), PT(mx + 6.2f, my + 6.2f), g_acc, 2.1f, g_round);
+        }
+        float tx = mx + 13.f, avail = q.right - 10.f - tx;
+        if (avail > 30.f) {
+            const wchar_t* ph = avail > 120.f ? L"Uygulama, dosya, web ara" : L"Ara";
+            Txt(rt, ph, g_fSearch, RF(tx + 2.f * h, q.top, q.right - 8.f, q.bottom), Col(1, 1, 1, 0.55f + 0.3f * h));
+        }
     }
 
     // ── stats rings
@@ -3149,7 +3179,7 @@ static void DarkMenus() {
     auto setMode = (fnMode)GetProcAddress(ux, MAKEINTRESOURCEA(135)); auto flush = (fnFlush)GetProcAddress(ux, MAKEINTRESOURCEA(136));
     if (setMode) setMode(2 /*ForceDark*/); if (flush) flush();
 }
-enum { ID_TASKMGR = 100, ID_SETTINGS, ID_RELOAD, ID_TOGGLETB, ID_AUTOSTART, ID_TOP, ID_EXIT, ID_NEWWIN, ID_PIN, ID_CLOSE, ID_STATS, ID_TITLE, ID_CENTER, ID_MEDIA, ID_PREVIEWS, ID_TRASH, ID_STYLE, ID_EMPTYTRASH, ID_LANG, ID_WEATHER, ID_AUTOACC, ID_FOCUS, ID_TRAY, ID_TRAYRESET };
+enum { ID_TASKMGR = 100, ID_SETTINGS, ID_RELOAD, ID_TOGGLETB, ID_AUTOSTART, ID_TOP, ID_EXIT, ID_NEWWIN, ID_PIN, ID_CLOSE, ID_STATS, ID_TITLE, ID_CENTER, ID_MEDIA, ID_PREVIEWS, ID_TRASH, ID_STYLE, ID_EMPTYTRASH, ID_LANG, ID_WEATHER, ID_AUTOACC, ID_FOCUS, ID_TRAY, ID_TRAYRESET, ID_SEARCH };
 static int ShowMenu(HMENU m) {
     POINT p; GetCursorPos(&p); SetForegroundWindow(g_hwnd);
     UINT fl = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | (g_cfg.top ? TPM_TOPALIGN : TPM_BOTTOMALIGN);
@@ -3171,6 +3201,7 @@ static void BarMenu() {
     AppendMenuW(m, MF_STRING | (g_cfg.trash ? MF_CHECKED : 0), ID_TRASH, L"Geri Dönüşüm Kutusu");
     AppendMenuW(m, MF_STRING | (g_cfg.lang ? MF_CHECKED : 0), ID_LANG, L"Klavye dili göstergesi");
     AppendMenuW(m, MF_STRING | (g_cfg.islands ? MF_CHECKED : 0), ID_STYLE, L"Ada görünümü");
+    AppendMenuW(m, MF_STRING | (g_cfg.search ? MF_CHECKED : 0), ID_SEARCH, L"Arama çubuğu");
     AppendMenuW(m, MF_STRING | (g_cfg.weather ? MF_CHECKED : 0), ID_WEATHER, L"Hava durumu");
     AppendMenuW(m, MF_STRING | (g_cfg.tray ? MF_CHECKED : 0), ID_TRAY, L"Sistem tepsisi simgeleri");
     if (!g_trayHide.empty()) AppendMenuW(m, MF_STRING, ID_TRAYRESET, (L"Gizlenen tepsi simgelerini geri getir (" + std::to_wstring(g_trayHide.size()) + L")").c_str());
@@ -3197,6 +3228,7 @@ static void BarMenu() {
     case ID_LANG: SetIniBool(L"ShowKeyboardLayout", !g_cfg.lang); reload(); ReadLang(); break;
     case ID_TRAYRESET: g_trayHide.clear(); SaveTrayHide(); Kick(); break;
     case ID_TRAY: SetIniBool(L"ShowTray", !g_cfg.tray); reload(); if (g_cfg.tray) CreateTrayHost(); else DestroyTrayHost(); break;
+    case ID_SEARCH: SetIniBool(L"ShowSearch", !g_cfg.search); reload(); Kick(); break;
     case ID_WEATHER: SetIniBool(L"ShowWeather", !g_cfg.weather); reload(); g_wxNext = 0; WeatherTick(true); break;
     case ID_AUTOACC: SetIniBool(L"AutoAccent", !g_cfg.autoAccent); reload(); g_brushDirty = true; break;
     case ID_FOCUS: if (g_focusOn) StopFocus(); else StartFocus(); break;
@@ -3249,7 +3281,7 @@ static void AppMenu(AppItem* it) {
             g_items.insert(g_items.begin() + std::min(pos, g_items.size()), it);
         }
         SavePins(); g_winCache.clear(); RefreshWindows(); Kick();
-    } else if (r == ID_CLOSE) for (HWND w : it->wins) PostMessageW(w, WM_CLOSE, 0, 0);
+    } else if (r == ID_CLOSE) { for (HWND w : it->wins) PostMessageW(w, WM_CLOSE, 0, 0); SetTimer(g_hwnd, TMR_REFRESH, 250, nullptr); }
 }
 
 // ───────────────────────────── input ─────────────────────────────
@@ -3257,6 +3289,7 @@ static Hit HitTest(float x, float y) {
     x -= g_md; y -= g_md;
     Hit h;
     if (InR(g_rStart, x, y)) h.k = RK_START;
+    else if (g_cfg.search && InR(g_rSearch, x, y)) h.k = RK_SEARCH;
     else if (g_cfg.stats && InR(g_rStats, x, y)) h.k = RK_STATS;
     else if (InR(g_rQuick, x, y)) h.k = RK_QUICK;
     else if (InR(g_rClock, x, y)) h.k = RK_CLOCK;
@@ -3279,7 +3312,7 @@ static void SetHover(const Hit& h) {
     bool p = g_press.k != RK_NONE && g_press == h;
     g_pStart.t = p && h.k == RK_START; g_pQuick.t = p && h.k == RK_QUICK; g_pClock.t = p && h.k == RK_CLOCK; g_pDesk.t = p && h.k == RK_DESK;
     g_hMInfo.t = h.k == RK_MINFO; g_hMPrev.t = h.k == RK_MPREV; g_hMPlay.t = h.k == RK_MPLAY; g_hMNext.t = h.k == RK_MNEXT; g_hLang.t = h.k == RK_LANG;
-    g_hFocus.t = h.k == RK_FOCUS; g_hWeather.t = h.k == RK_WEATHER; g_pWeather.t = p && h.k == RK_WEATHER;
+    g_hFocus.t = h.k == RK_FOCUS; g_hWeather.t = h.k == RK_WEATHER; g_pWeather.t = p && h.k == RK_WEATHER; g_hSearch.t = h.k == RK_SEARCH; g_pSearch.t = p && h.k == RK_SEARCH;
     g_pMPrev.t = p && h.k == RK_MPREV; g_pMPlay.t = p && h.k == RK_MPLAY; g_pMNext.t = p && h.k == RK_MNEXT; g_pLang.t = p && h.k == RK_LANG;
     for (auto* t : g_tray) t->hv.t = (h.k == RK_TRAY && h.ti == t) ? 1.f : 0.f;
     g_hTrayMore.t = h.k == RK_TRAYMORE; g_pTrayMore.t = p && h.k == RK_TRAYMORE;
@@ -3310,6 +3343,7 @@ static void DoClick(const Hit& h) {
     if (Sticky() && !toggles) ClosePopup();
     switch (h.k) {
     case RK_START: if (!g_shellFlyoutWasOpen) SendKeys({VK_LWIN}); break; // a second click closes Start
+    case RK_SEARCH: if (!g_shellFlyoutWasOpen) SendKeys({VK_LWIN, 'S'}); break; // a second click closes Search
     case RK_APP: if (h.it) { ClosePopup(); ClickApp(h.it); } break;
     case RK_STATS: ShellExecuteW(nullptr, L"open", L"taskmgr.exe", nullptr, nullptr, SW_SHOWNORMAL); break;
     case RK_QUICK: if (Sticky() && g_popMode == PM_CONTROL && g_popA.t > 0.5f) ClosePopup(); else OpenFlyout(PM_CONTROL, (g_rQuick.left + g_rQuick.right) / 2); break;
@@ -3344,13 +3378,14 @@ static void ChangeVolume(float delta) {
 // ───────────────────────────── win events ─────────────────────────────
 static void CALLBACK WinEvent(HWINEVENTHOOK, DWORD ev, HWND h, LONG obj, LONG child, DWORD, DWORD) {
     if (obj != OBJID_WINDOW || child != CHILDID_SELF || !h) return;
+    if (ev == EVENT_SYSTEM_MINIMIZESTART) { UpdateActive(); Kick(); return; }
     if (ev == EVENT_SYSTEM_FOREGROUND || ev == EVENT_SYSTEM_MINIMIZEEND) { UpdateActive(); if (ev == EVENT_SYSTEM_FOREGROUND) ReadLang(); CheckFullscreen(); Kick(); return; }
     if (ev == EVENT_OBJECT_NAMECHANGE) { if (h == g_fg) UpdateActive(); return; }
     if (ev == EVENT_OBJECT_SHOW && g_cfg.hideTaskbar && g_tbHidden) {
         wchar_t cls[32]; GetClassNameW(h, cls, 32);
         if (!wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd")) { ShowWindow(h, SW_HIDE); return; }
     }
-    if (ev == EVENT_OBJECT_DESTROY) { if (!g_winCache.count(h)) return; }
+    if (ev == EVENT_OBJECT_DESTROY) { if (!g_winCache.count(h)) return; if (h == g_fg) { g_fg = nullptr; UpdateActive(); Kick(); } }
     else if (GetAncestor(h, GA_ROOT) != h) return;
     SetTimer(g_hwnd, TMR_REFRESH, 60, nullptr);
 }
